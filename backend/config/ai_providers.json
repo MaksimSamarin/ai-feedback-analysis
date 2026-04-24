@@ -1,0 +1,24 @@
+﻿{
+  "providers": {
+    "openai": {
+      "label": "OpenAI",
+      "label_env": "OPENAI_PROVIDER_LABEL",
+      "models": [
+        "gpt-4o-mini",
+        "gpt-4.1-mini"
+      ],
+      "base_url_env": "OPENAI_BASE_URL",
+      "base_url_default": "https://api.openai.com",
+      "models_env": "OPENAI_MODELS"
+    },
+    "ollama": {
+      "label": "Ollama (внешний хост)",
+      "models": [
+        "llama3.1:latest"
+      ],
+      "base_url_env": "OLLAMA_BASE_URL",
+      "base_url_default": "",
+      "models_env": "OLLAMA_MODELS"
+    }
+  }
+}

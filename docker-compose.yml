@@ -1,0 +1,276 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-${DOCKER_REGISTRY_PREFIX:-}postgres:${POSTGRES_IMAGE_VERSION:-16-alpine}}
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - autovacuum=on
+      - -c
+      - autovacuum_naptime=10s
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      - -c
+      - autovacuum_analyze_scale_factor=0.02
+      - -c
+      - autovacuum_vacuum_cost_limit=2000
+      - -c
+      - autovacuum_max_workers=6
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-review_analyzer}
+      POSTGRES_USER: ${POSTGRES_USER:-review_analyzer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-review_analyzer}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./ops/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-review_analyzer} -d ${POSTGRES_DB:-review_analyzer}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 4g
+    cpus:  3.0
+    logging:
+      driver: json-file
+      options:
+        max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+        max-file: ${DOCKER_LOG_MAX_FILE:-5}
+
+  redis:
+    image: ${REDIS_IMAGE:-${DOCKER_REGISTRY_PREFIX:-}redis:${REDIS_IMAGE_VERSION:-7-alpine}}
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 1g
+    cpus:  0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+        max-file: ${DOCKER_LOG_MAX_FILE:-5}
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-${DOCKER_REGISTRY_PREFIX:-}python:${PYTHON_BASE_IMAGE_VERSION:-3.12-slim}}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
+    restart: unless-stopped
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_MODELS: ${OPENAI_MODELS:-gpt-4o-mini,gpt-4.1-mini}
+      OPENAI_PROVIDER_LABEL: ${OPENAI_PROVIDER_LABEL:-OpenAI}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_MODELS: ${OLLAMA_MODELS:-}
+      AI_PROVIDERS_CONFIG_PATH: ${AI_PROVIDERS_CONFIG_PATH:-/app/config/ai_providers.json}
+      APP_SECRET: ${APP_SECRET:?APP_SECRET is required}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-session_token}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-0}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      BOOTSTRAP_ADMIN_FORCE_PASSWORD: ${BOOTSTRAP_ADMIN_FORCE_PASSWORD:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REQUEST_TIMEOUT_SEC: ${REQUEST_TIMEOUT_SEC:-60}
+      LLM_RETRIES: ${LLM_RETRIES:-2}
+      MAX_LLM_CACHE_ROWS: ${MAX_LLM_CACHE_ROWS:-2000000}
+      MAX_SEMANTIC_CACHE_ROWS: ${MAX_SEMANTIC_CACHE_ROWS:-500000}
+      CACHE_MAINTENANCE_INTERVAL_SEC: ${CACHE_MAINTENANCE_INTERVAL_SEC:-300}
+      SEMANTIC_CACHE_ENABLED: ${SEMANTIC_CACHE_ENABLED:-1}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+      SEMANTIC_CACHE_THRESHOLD: ${SEMANTIC_CACHE_THRESHOLD:-0.94}
+      SEMANTIC_CACHE_CANDIDATES: ${SEMANTIC_CACHE_CANDIDATES:-200}
+      GLOBAL_LLM_PARALLELISM: ${GLOBAL_LLM_PARALLELISM:-12}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_QUEUE_KEY: ${REDIS_QUEUE_KEY:-review_analyzer:jobs}
+      REDIS_INSPECT_QUEUE_KEY: ${REDIS_INSPECT_QUEUE_KEY:-review_analyzer:file_inspect_jobs}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://review_analyzer:review_analyzer@postgres:5432/review_analyzer}
+      DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-12}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - backend_data:/app/data
+      - backend_results:/app/results
+      - ./examples:/app/examples:ro
+      - ./docs:/app/docs:ro
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    mem_limit: 1500m
+    cpus:  0.75
+    logging:
+      driver: json-file
+      options:
+        max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+        max-file: ${DOCKER_LOG_MAX_FILE:-5}
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-${DOCKER_REGISTRY_PREFIX:-}python:${PYTHON_BASE_IMAGE_VERSION:-3.12-slim}}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_MODELS: ${OPENAI_MODELS:-gpt-4o-mini,gpt-4.1-mini}
+      OPENAI_PROVIDER_LABEL: ${OPENAI_PROVIDER_LABEL:-OpenAI}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_MODELS: ${OLLAMA_MODELS:-}
+      AI_PROVIDERS_CONFIG_PATH: ${AI_PROVIDERS_CONFIG_PATH:-/app/config/ai_providers.json}
+      APP_SECRET: ${APP_SECRET:?APP_SECRET is required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REQUEST_TIMEOUT_SEC: ${REQUEST_TIMEOUT_SEC:-60}
+      LLM_RETRIES: ${LLM_RETRIES:-2}
+      MAX_LLM_CACHE_ROWS: ${MAX_LLM_CACHE_ROWS:-2000000}
+      MAX_SEMANTIC_CACHE_ROWS: ${MAX_SEMANTIC_CACHE_ROWS:-500000}
+      CACHE_MAINTENANCE_INTERVAL_SEC: ${CACHE_MAINTENANCE_INTERVAL_SEC:-300}
+      SEMANTIC_CACHE_ENABLED: ${SEMANTIC_CACHE_ENABLED:-1}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+      SEMANTIC_CACHE_THRESHOLD: ${SEMANTIC_CACHE_THRESHOLD:-0.94}
+      SEMANTIC_CACHE_CANDIDATES: ${SEMANTIC_CACHE_CANDIDATES:-200}
+      GLOBAL_LLM_PARALLELISM: ${GLOBAL_LLM_PARALLELISM:-12}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_QUEUE_KEY: ${REDIS_QUEUE_KEY:-review_analyzer:jobs}
+      REDIS_INSPECT_QUEUE_KEY: ${REDIS_INSPECT_QUEUE_KEY:-review_analyzer:file_inspect_jobs}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://review_analyzer:review_analyzer@postgres:5432/review_analyzer}
+      DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-12}
+      WORKER_MODE: analysis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    volumes:
+      - backend_data:/app/data
+      - backend_results:/app/results
+    mem_limit: 2500m
+    cpus:  1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+        max-file: ${DOCKER_LOG_MAX_FILE:-5}
+
+  inspect-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-${DOCKER_REGISTRY_PREFIX:-}python:${PYTHON_BASE_IMAGE_VERSION:-3.12-slim}}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_MODELS: ${OPENAI_MODELS:-gpt-4o-mini,gpt-4.1-mini}
+      OPENAI_PROVIDER_LABEL: ${OPENAI_PROVIDER_LABEL:-OpenAI}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_MODELS: ${OLLAMA_MODELS:-}
+      AI_PROVIDERS_CONFIG_PATH: ${AI_PROVIDERS_CONFIG_PATH:-/app/config/ai_providers.json}
+      APP_SECRET: ${APP_SECRET:?APP_SECRET is required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REQUEST_TIMEOUT_SEC: ${REQUEST_TIMEOUT_SEC:-60}
+      LLM_RETRIES: ${LLM_RETRIES:-2}
+      MAX_LLM_CACHE_ROWS: ${MAX_LLM_CACHE_ROWS:-2000000}
+      MAX_SEMANTIC_CACHE_ROWS: ${MAX_SEMANTIC_CACHE_ROWS:-500000}
+      CACHE_MAINTENANCE_INTERVAL_SEC: ${CACHE_MAINTENANCE_INTERVAL_SEC:-300}
+      SEMANTIC_CACHE_ENABLED: ${SEMANTIC_CACHE_ENABLED:-1}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+      SEMANTIC_CACHE_THRESHOLD: ${SEMANTIC_CACHE_THRESHOLD:-0.94}
+      SEMANTIC_CACHE_CANDIDATES: ${SEMANTIC_CACHE_CANDIDATES:-200}
+      GLOBAL_LLM_PARALLELISM: ${GLOBAL_LLM_PARALLELISM:-12}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_QUEUE_KEY: ${REDIS_QUEUE_KEY:-review_analyzer:jobs}
+      REDIS_INSPECT_QUEUE_KEY: ${REDIS_INSPECT_QUEUE_KEY:-review_analyzer:file_inspect_jobs}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://review_analyzer:review_analyzer@postgres:5432/review_analyzer}
+      DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-12}
+      WORKER_MODE: inspect
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    volumes:
+      - backend_data:/app/data
+      - backend_results:/app/results
+    mem_limit: 2g
+    cpus:  0.75
+    logging:
+      driver: json-file
+      options:
+        max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+        max-file: ${DOCKER_LOG_MAX_FILE:-5}
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NODE_BASE_IMAGE: ${NODE_BASE_IMAGE:-${DOCKER_REGISTRY_PREFIX:-}node:${NODE_BASE_IMAGE_VERSION:-20-alpine}}
+        NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-${DOCKER_REGISTRY_PREFIX:-}nginx:${NGINX_BASE_IMAGE_VERSION:-1.27-alpine}}
+        NPM_REGISTRY_URL: ${NPM_REGISTRY_URL:-https://registry.npmjs.org/}
+        NPM_STRICT_SSL: ${NPM_STRICT_SSL:-true}
+        APK_REPOSITORY_MAIN_URL: ${APK_REPOSITORY_MAIN_URL:-}
+        APK_REPOSITORY_COMMUNITY_URL: ${APK_REPOSITORY_COMMUNITY_URL:-}
+        APK_TLS_NO_VERIFY: ${APK_TLS_NO_VERIFY:-false}
+        VITE_API_BASE: /api
+    restart: unless-stopped
+    depends_on:
+      - backend
+    volumes:
+      - ./branding:/usr/share/nginx/html/branding:ro
+    ports:
+      - "8080:80"
+    mem_limit: 512m
+    cpus: 0.25
+    logging:
+      driver: json-file
+      options:
+        max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+        max-file: ${DOCKER_LOG_MAX_FILE:-5}
+
+volumes:
+  backend_data:
+  backend_results:
+  pg_data:
+  redis_data:

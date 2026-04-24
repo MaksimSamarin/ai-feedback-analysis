@@ -1,0 +1,13 @@
+﻿fastapi==0.115.8
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+openpyxl==3.1.5
+python-calamine==0.5.4
+pydantic==2.10.6
+httpx==0.28.1
+orjson==3.10.15
+redis==5.2.1
+psycopg[binary]==3.2.5
+cryptography==44.0.2
+argon2-cffi==23.1.0
+psycopg-pool==3.2.5

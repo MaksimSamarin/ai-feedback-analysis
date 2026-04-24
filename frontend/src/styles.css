@@ -1,0 +1,198 @@
+﻿@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
+:root {
+  --brand-accent: #1976d2;
+  --brand-accent-dark: #0d47a1;
+  --ink-900: #151b2b;
+  --ink-700: #3a4359;
+  --line-200: #dfe3ec;
+  --surface-soft: rgba(255, 255, 255, 0.76);
+  --surface-strong: #ffffff;
+  --hero-fade: radial-gradient(circle at 8% 5%, rgba(25, 118, 210, 0.1) 0%, rgba(25, 118, 210, 0.02) 35%, transparent 70%);
+  --bg-gradient: linear-gradient(180deg, #f8faff 0%, #f4f7fc 100%);
+  --card-shadow: 0 12px 28px rgba(15, 23, 42, 0.09);
+  --dropzone-border: #c9d2e3;
+  --dropzone-bg: rgba(255, 255, 255, 0.85);
+  --dropzone-active-bg: rgba(25, 118, 210, 0.06);
+  --logs-bg: #f9fbff;
+  --logs-border: #dbe3f2;
+  --charts-border: #dde5f3;
+}
+
+html[data-theme="dark"] {
+  --brand-accent: #64b5f6;
+  --brand-accent-dark: #1976d2;
+  --ink-900: #f2f4f9;
+  --ink-700: #cad2e3;
+  --line-200: #2f3a51;
+  --surface-soft: rgba(23, 29, 46, 0.78);
+  --surface-strong: #171d2e;
+  --hero-fade: radial-gradient(circle at 8% 5%, rgba(100, 181, 246, 0.16) 0%, rgba(100, 181, 246, 0.02) 35%, transparent 70%);
+  --bg-gradient: linear-gradient(180deg, #0f1320 0%, #12192b 100%);
+  --card-shadow: 0 16px 36px rgba(0, 0, 0, 0.4);
+  --dropzone-border: #394561;
+  --dropzone-bg: rgba(18, 25, 43, 0.8);
+  --dropzone-active-bg: rgba(100, 181, 246, 0.16);
+  --logs-bg: #11182a;
+  --logs-border: #31405f;
+  --charts-border: #31405f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.page {
+  min-height: 100vh;
+  position: relative;
+  background: var(--bg-gradient);
+  color: var(--ink-900);
+}
+
+.hero {
+  position: absolute;
+  inset: 0;
+  background: var(--hero-fade);
+  pointer-events: none;
+}
+
+.container {
+  position: relative;
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 26px 16px 38px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.title {
+  font-weight: 800;
+  color: var(--ink-900);
+}
+
+.subtitle {
+  color: var(--ink-700);
+}
+
+.brandBox {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.brandText {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 100%;
+}
+
+.brandLogoFrame {
+  width: clamp(112px, 14vw, 170px);
+  height: clamp(46px, 6vw, 72px);
+  min-width: 112px;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  box-shadow: none;
+}
+
+.brandLogo {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  object-fit: contain;
+  object-position: center;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  display: block;
+  transform: none;
+  transform-origin: center;
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.32));
+}
+
+@media (max-width: 768px) {
+  .brandBox {
+    gap: 12px;
+  }
+
+  .brandLogoFrame {
+    width: 108px;
+    height: 44px;
+    min-width: 108px;
+    border-radius: 0;
+  }
+
+  .brandLogo {
+    transform: scale(1.05);
+  }
+}
+
+.card {
+  background: var(--surface-soft);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--line-200);
+  box-shadow: var(--card-shadow);
+}
+
+.dropzone {
+  margin-top: 10px;
+  border: 2px dashed var(--dropzone-border);
+  border-radius: 14px;
+  padding: 30px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+  transition: all 0.2s ease;
+  background: var(--dropzone-bg);
+}
+
+.dropzone.active {
+  border-color: var(--brand-accent);
+  background: var(--dropzone-active-bg);
+}
+
+.logs {
+  margin-top: 12px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--logs-border);
+  border-radius: 10px;
+  background: var(--logs-bg);
+  padding: 10px;
+}
+
+.logline {
+  font-family: "IBM Plex Mono", "Consolas", monospace;
+  font-size: 0.84rem;
+}
+
+.chartWrap {
+  flex: 1;
+  min-width: 260px;
+  border: 1px solid var(--charts-border);
+  border-radius: 10px;
+  padding: 8px;
+  background: var(--surface-strong);
+}
+
+@media (max-width: 768px) {
+  .container {
+    padding: 18px 10px 26px;
+  }
+
+  .dropzone {
+    padding: 18px;
+  }
+}

@@ -1,0 +1,39 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Backend runtime data
+backend/data/uploads/*
+backend/results/*
+!backend/data/uploads/.gitkeep
+!backend/results/.gitkeep
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Env
+.env
+frontend/.env
+.venv/
+backend/.venv/
+
+# Local DB/logs
+backend/data/app.db
+backend/data/logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor local settings
+.vscode/
+.claude/
+.mcp.json
+
+# Local monitoring artifacts
+ops/monitoring/*.log
+
+# Local curl cookie jar
+cookies.txt
