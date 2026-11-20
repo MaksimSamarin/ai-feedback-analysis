@@ -7,7 +7,7 @@ import httpx
 
 from app.config import get_provider_base_url
 
-from .base import ContextLengthExceeded, LLMProvider
+from .base import ContextLengthExceeded, InvalidLLMResponse, LLMProvider
 
 
 _OLLAMA_CONTEXT_HINTS = (
@@ -60,7 +60,6 @@ class OllamaProvider(LLMProvider):
             payload = resp.json()
 
         content = payload.get("response", "{}")
-        data = json.loads(content)
         raw = {
             "provider": self.id,
             "model": model,
@@ -69,4 +68,13 @@ class OllamaProvider(LLMProvider):
             "eval_count": payload.get("eval_count"),
             "temperature": temperature,
         }
+        if "prompt_eval_count" in payload or "eval_count" in payload:
+            prompt_tokens = int(payload.get("prompt_eval_count") or 0)
+            completion_tokens = int(payload.get("eval_count") or 0)
+            raw["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens}
+        try:
+            data = json.loads(content)
+        except (ValueError, TypeError) as exc:
+            raise InvalidLLMResponse(f"Не JSON: {exc}", raw) from exc
         return data, raw

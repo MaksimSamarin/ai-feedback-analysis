@@ -1,4 +1,18 @@
-﻿import { useEffect, useMemo, useRef, useState, type ClipboardEvent } from "react";
+import { getUiLanguage, uiText, uiLocale } from "./i18n";
+import { englishReadyPreset } from "./englishPresets";
+import { ModelSetupNotice, EMPTY_MODELS_TEXT } from "./modelSetup";
+import { PartialDownloadHint } from "./downloadPresentation";
+import { UserIdentity } from "./userIdentity";
+import { chooseModel, restoreProvider, type ModelChoice } from "./modelChoice";
+import { UserRulesDialog, UserMarkdown } from "./userRules";
+import { shouldAutoShowRelease, releaseNotesErrorMessage } from "./releaseVisibility";
+import { createFocusAccessRefresh } from "./accessRefresh";
+import { rememberPendingRequests } from "./requestNoticeState";
+import { AccessRequestNotice, RequestAccessButton } from "./accessRequestNotice";
+import { revealLaunchElement } from "./launchFocus";
+import { chooseQuota, quotaAvailable, quotaBlockedReason, retainQuotaSelection } from "./quotaChoice";
+import { ReportQuota } from "./reportQuota";
+import { useEffect, useId, useMemo, useRef, useState, type ClipboardEvent } from "react";
 import {
   Accordion,
   AccordionDetails,
@@ -47,6 +61,7 @@ import {
   Typography,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
 import FolderOpenIcon from "@mui/icons-material/FolderOpen";
 import CloseIcon from "@mui/icons-material/Close";
@@ -64,57 +79,81 @@ import DarkModeIcon from "@mui/icons-material/DarkMode";
 import LightModeIcon from "@mui/icons-material/LightMode";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
-import MoreVertIcon from "@mui/icons-material/MoreVert";
-import MoreHorizIcon from "@mui/icons-material/MoreHoriz";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import SettingsIcon from "@mui/icons-material/Settings";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import { Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from "recharts";
 
-import { api, type ExampleFile, type ReleaseEntry } from "./api";
-import ReactMarkdown from "react-markdown";
+import { api, APIError, type ExampleFile, type ReleaseEntry } from "./api";
 import { GrabScrollBox } from "./useGrabScroll";
 import type {
-  AdminLogItem,
-  AdminStats,
-  AdminUserItem,
+  AuthConfig,
   FileInspectResponse,
-  JobState,
   JobSummary,
   Provider,
   ReportAnalysis,
   ReportItem,
-  SseEvent,
   Usage,
   User,
   UserPreset,
   VerifyTokenResult,
 } from "./types";
 import "./styles.css";
+import "./workspace.css";
 import { useThemeMode } from "./theme";
+import { AccessPage, AccessRequestForm, GroupUsage, accessCall, type AccessState, type AccessGroup } from "./access";
+
+import { AdminScreen, navigate, useLocationHash } from "./admin";
 
 const TOKEN_SESSION_KEY = "review_analyzer_provider_token";
 const LAST_PROVIDER_KEY = "review_analyzer_last_provider";
 const LAST_MODEL_KEY = "review_analyzer_last_model";
-const APP_VERSION = "2.0.0";
+// При апдейте APP_VERSION диалог «Заметки о релизе» автоматически
+// открывается один раз для каждого пользователя (см. useEffect ниже).
+const RELEASE_NOTES_SEEN_VERSION_KEY = "review_analyzer_release_notes_seen_version";
+const APP_VERSION = "2.2.0";
 
 function formatQueueHint(position: number | null | undefined): string {
   if (typeof position !== "number" || position < 0) return "";
-  if (position === 0) return "Следующий в очереди";
-  return `Перед вами: ${position}`;
+  if (position === 0) return uiText("Следующий в очереди");
+  return uiText("Перед вами: {0}", position);
+}
+
+/**
+ * Хинт под чипом «В очереди». Различает два случая:
+ *   — personal_queue=true → отчёт ждёт пока юзер освободит свой slot
+ *     (превышен MAX_ACTIVE_PER_USER на пользователя)
+ *   — обычная queued → стандартная позиция в общей очереди.
+ */
+function formatQueuedHint(r: { personal_queue?: boolean; queue_position?: number | null }): string {
+  if (r.personal_queue) {
+    return uiText("Ждём пока завершится один из ваших активных отчётов и встанем в очередь");
+  }
+  return formatQueueHint(r.queue_position);
 }
 const BRAND_LOGO_CANDIDATES = [
   "/branding/logo.png",
+  "/branding/logo.svg",
+  "/review-pixel.png",
   "/branding/logo-default.png",
   "/logo-default.svg",
 ] as const;
 type ReadyPresetId = "fraud_individual" | "fraud_by_store";
 const READY_PRESET_IDS: ReadyPresetId[] = ["fraud_individual", "fraud_by_store"];
 const READY_PRESETS: Array<{ id: ReadyPresetId; label: string }> = [
-  { id: "fraud_individual", label: "Пример: Проверка отзывов на мошенничество сотрудников" },
-  { id: "fraud_by_store", label: "Пример: Анализ мошенничества по магазинам (группировка)" },
+  { id: "fraud_individual", label: uiText("Пример: Проверка отзывов на мошенничество сотрудников") },
+  { id: "fraud_by_store", label: uiText("Пример: Анализ мошенничества по магазинам (группировка)") },
 ];
 const API_ROOT = api.base.endsWith("/api") ? api.base : `${api.base}/api`;
+
+/** Число из поля ввода: принимает десятичную запятую («2,5»); пустое или некорректное — null. */
+export function parseDecimal(raw: string): number | null {
+  const text = raw.trim().replace(/\s+/g, "").replace(",", ".");
+  if (!text) return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
 
 type BuilderFieldType = "text" | "number" | "datetime" | "list";
 type BuilderDateMode = "date" | "datetime";
@@ -139,7 +178,7 @@ function fmtDate(value: string | null): string {
   if (!value) return "-";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return value;
-  return d.toLocaleString("ru-RU");
+  return d.toLocaleString(uiLocale());
 }
 
 /**
@@ -168,37 +207,38 @@ function FieldLabelContent({ label, hint }: { label: string; hint: string }) {
 
 function statusLabel(status: string): string {
   switch (status) {
-    case "queued": return "В очереди";
-    case "running": return "В работе";
-    case "paused": return "На паузе";
-    case "completed": return "Готов";
-    case "failed": return "Ошибка";
-    case "canceled": return "Отменён";
+    case "queued": return uiText("В очереди");
+    case "running": return uiText("В работе");
+    case "paused": return uiText("На паузе");
+    case "completed": return uiText("Готов");
+    case "failed": return uiText("Ошибка");
+    case "canceled": return uiText("Отменён");
     default: return status;
   }
 }
 
 function statusColor(status: string): "default" | "primary" | "success" | "warning" | "error" | "info" {
   switch (status) {
-    case "running": return "warning";    // активное действие — оранжевый привлекает внимание
+    case "running": return "warning";    // активное действие — амбра filled (полная насыщенность)
     case "completed": return "success";  // зелёный — готово
-    case "paused": return "default";     // спокойный серый — на паузе
+    case "paused": return "warning";     // outlined-амбра — синхронно с кнопкой «Пауза» (та же color="warning")
     case "failed": return "error";       // красный — ошибка
-    case "canceled": return "default";   // серый — отменён пользователем
+    case "canceled": return "default";   // серый — отменён пользователем (терминальное)
     case "queued": return "info";        // голубой — нейтральное ожидание
     default: return "default";
   }
 }
 
 function progressBarColor(status: string): "primary" | "success" | "warning" | "error" | "info" | "inherit" {
-  // LinearProgress не поддерживает "default", поэтому для нейтральных статусов
-  // отдаём "inherit" (наследует цвет текста — серовато-нейтрально).
+  // Бар = тот же color, что и чип. Для paused добавляется className="lp-paused"
+  // в <LinearProgress> — он применит opacity:0.5 и покажет «придержанный» тон.
+  // canceled остаётся inherit (серый — терминальное состояние).
   switch (status) {
     case "running": return "warning";
+    case "paused": return "warning";
     case "completed": return "success";
     case "failed": return "error";
     case "queued": return "info";
-    case "paused":
     case "canceled":
     default:
       return "inherit";
@@ -208,10 +248,10 @@ function progressBarColor(status: string): "primary" | "success" | "warning" | "
 function pluralizeGroups(n: number): string {
   const mod100 = n % 100;
   const mod10 = n % 10;
-  if (mod100 >= 11 && mod100 <= 14) return "групп";
-  if (mod10 === 1) return "группа";
-  if (mod10 >= 2 && mod10 <= 4) return "группы";
-  return "групп";
+  if (mod100 >= 11 && mod100 <= 14) return uiText("групп");
+  if (mod10 === 1) return uiText("группа");
+  if (mod10 >= 2 && mod10 <= 4) return uiText("группы");
+  return uiText("групп");
 }
 
 type ProgressSnapshot = {
@@ -245,11 +285,33 @@ function computeReportProgress(r: ReportItem | null | undefined): ProgressSnapsh
 function formatEta(seconds: number | null | undefined): string | null {
   if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return null;
   const s = Math.round(seconds);
-  if (s < 60) return `Осталось ~${s} сек`;
-  if (s < 3600) return `Осталось ~${Math.round(s / 60)} мин`;
+  if (s < 60) return uiText("Осталось ~{0} сек", s);
+  if (s < 3600) return uiText("Осталось ~{0} мин", Math.round(s / 60));
   const hours = Math.floor(s / 3600);
   const minutes = Math.round((s % 3600) / 60);
-  return minutes > 0 ? `Осталось ~${hours} ч ${minutes} мин` : `Осталось ~${hours} ч`;
+  return minutes > 0 ? uiText("Осталось ~{0} ч {1} мин", hours, minutes) : uiText("Осталось ~{0} ч", hours);
+}
+
+// Компактный формат счётчика токенов для меню юзера: 75 523 505 → "75.5 млн".
+// До 1000 — как есть; до миллиона — "X.Y тыс"; от миллиона — "X.Y млн".
+// Полное число со «100 523 505 →  100 523 505» доступно через formatTokenExact.
+function formatTokenCount(n: number | null | undefined): string {
+  const value = Number(n ?? 0);
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  if (value < 1000) return String(Math.round(value));
+  if (value < 1_000_000) {
+    const thousands = value / 1000;
+    return thousands < 10 ? uiText("{0} тыс", thousands.toFixed(1)) : uiText("{0} тыс", Math.round(thousands));
+  }
+  const millions = value / 1_000_000;
+  return millions < 10 ? uiText("{0} млн", millions.toFixed(1)) : uiText("{0} млн", Math.round(millions));
+}
+
+// Полное число с разделителями тысяч — для tooltip'а.
+function formatTokenExact(n: number | null | undefined): string {
+  const value = Number(n ?? 0);
+  if (!Number.isFinite(value)) return "0";
+  return Math.round(value).toLocaleString(uiLocale());
 }
 
 const _CURRENT_STEP_DUPLICATE_RE = /^(Обработка|На паузе)\s+\d+\/\d+\s*$/;
@@ -272,7 +334,7 @@ function visibleCurrentStep(step: string | null | undefined): string | null {
   if (_CURRENT_STEP_DUPLICATE_RE.test(trimmed)) return null;
   // Точное совпадение со статусом ("В очереди", "Завершено", "Отменено пользователем").
   if (_CURRENT_STEP_DUPLICATE_EXACT.has(trimmed)) return null;
-  return trimmed;
+  return uiText(trimmed);
 }
 
 function createFieldId(): string {
@@ -280,17 +342,6 @@ function createFieldId(): string {
     return crypto.randomUUID();
   }
   return `field_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function parseLines(value: string): string[] {
-  return value
-    .split(/\r?\n|,/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function buildLines(values: string[]): string {
-  return values.join("\n");
 }
 
 function defaultSchemaFields(): SchemaField[] {
@@ -325,8 +376,10 @@ function fieldToExpectedSchema(field: SchemaField): Record<string, unknown> {
 
   if (field.type === "number") {
     const schema: Record<string, unknown> = { type: field.numberIntegerOnly ? "integer" : "number" };
-    if (field.numberMin.trim()) schema.min = Number(field.numberMin);
-    if (field.numberMax.trim()) schema.max = Number(field.numberMax);
+    const min = parseDecimal(field.numberMin);
+    const max = parseDecimal(field.numberMax);
+    if (min !== null) schema.min = min;
+    if (max !== null) schema.max = max;
     return schema;
   }
 
@@ -413,7 +466,7 @@ function expectedJsonToFields(expectedJson: Record<string, unknown>): SchemaFiel
   const ordered: SchemaField[] = [];
   for (const [name, rawSchema] of Object.entries(expectedJson)) {
     if (!rawSchema || Array.isArray(rawSchema) || typeof rawSchema !== "object") {
-      throw new Error(`Поле '${name}' не является объектом схемы.`);
+      throw new Error(uiText("Поле '{0}' не является объектом схемы.", name));
     }
     ordered.push(schemaToField(name, rawSchema as Record<string, unknown>));
   }
@@ -422,21 +475,21 @@ function expectedJsonToFields(expectedJson: Record<string, unknown>): SchemaFiel
 
 function validateExpectedJsonTemplate(payload: Record<string, unknown>): string | null {
   const keys = Object.keys(payload);
-  if (!keys.length) return "Ожидаемый JSON не должен быть пустым — добавьте хотя бы одно поле.";
+  if (!keys.length) return uiText("Ожидаемый JSON не должен быть пустым — добавьте хотя бы одно поле.");
   const validateFieldSchema = (fieldName: string, value: unknown): string | null => {
     if (!value || Array.isArray(value) || typeof value !== "object") {
-      return `Поле '${fieldName}' должно быть объектом схемы, например {"type":"string"}.`;
+      return uiText("Поле '{0}' должно быть объектом схемы, например {\"type\":\"string\"}.", fieldName);
     }
     const schema = value as Record<string, unknown>;
     const schemaType = typeof schema.type === "string" ? schema.type.trim().toLowerCase() : "";
-    if (!schemaType) return `Поле '${fieldName}' должно содержать ключ 'type'.`;
+    if (!schemaType) return uiText("Поле '{0}' должно содержать ключ 'type'.", fieldName);
 
     if (schemaType === "string") {
       if ("min_length" in schema && (!Number.isInteger(schema.min_length) || Number(schema.min_length) < 0)) {
-        return `Поле '${fieldName}': min_length должен быть целым числом >= 0.`;
+        return uiText("Поле '{0}': min_length должен быть целым числом >= 0.", fieldName);
       }
       if ("max_length" in schema && (!Number.isInteger(schema.max_length) || Number(schema.max_length) < 1)) {
-        return `Поле '${fieldName}': max_length должен быть целым числом >= 1.`;
+        return uiText("Поле '{0}': max_length должен быть целым числом >= 1.", fieldName);
       }
       return null;
     }
@@ -447,10 +500,10 @@ function validateExpectedJsonTemplate(payload: Record<string, unknown>): string 
 
     if (schemaType === "number" || schemaType === "integer") {
       if ("min" in schema && typeof schema.min !== "number") {
-        return `Поле '${fieldName}': min должен быть числом.`;
+        return uiText("Поле '{0}': min должен быть числом.", fieldName);
       }
       if ("max" in schema && typeof schema.max !== "number") {
-        return `Поле '${fieldName}': max должен быть числом.`;
+        return uiText("Поле '{0}': max должен быть числом.", fieldName);
       }
       return null;
     }
@@ -461,17 +514,17 @@ function validateExpectedJsonTemplate(payload: Record<string, unknown>): string 
 
     if (schemaType === "enum") {
       if (!Array.isArray(schema.values) || !schema.values.length) {
-        return `Поле '${fieldName}' с type=enum должно содержать непустой массив values.`;
+        return uiText("Поле '{0}' с type=enum должно содержать непустой массив values.", fieldName);
       }
       if (schema.values.some((item) => typeof item !== "string" || !item.trim())) {
-        return `Поле '${fieldName}' с type=enum должно содержать только непустые строки в values.`;
+        return uiText("Поле '{0}' с type=enum должно содержать только непустые строки в values.", fieldName);
       }
       return null;
     }
 
     if (schemaType === "array") {
       if (!schema.items || Array.isArray(schema.items) || typeof schema.items !== "object") {
-        return `Поле '${fieldName}' с type=array должно содержать объект items.`;
+        return uiText("Поле '{0}' с type=array должно содержать объект items.", fieldName);
       }
       return validateFieldSchema(`${fieldName}[]`, schema.items);
     }
@@ -479,27 +532,27 @@ function validateExpectedJsonTemplate(payload: Record<string, unknown>): string 
     if (schemaType === "object") {
       if (!("properties" in schema)) return null;
       if (!schema.properties || Array.isArray(schema.properties) || typeof schema.properties !== "object") {
-        return `Поле '${fieldName}' с type=object должно содержать объект properties.`;
+        return uiText("Поле '{0}' с type=object должно содержать объект properties.", fieldName);
       }
       const properties = schema.properties as Record<string, unknown>;
       for (const [childKey, childValue] of Object.entries(properties)) {
-        if (!childKey.trim()) return `Поле '${fieldName}' содержит пустой ключ в properties.`;
+        if (!childKey.trim()) return uiText("Поле '{0}' содержит пустой ключ в properties.", fieldName);
         const nestedError = validateFieldSchema(`${fieldName}.${childKey}`, childValue);
         if (nestedError) return nestedError;
       }
       if ("required" in schema) {
         if (!Array.isArray(schema.required) || schema.required.some((item) => typeof item !== "string")) {
-          return `Поле '${fieldName}': required должен быть массивом строк.`;
+          return uiText("Поле '{0}': required должен быть массивом строк.", fieldName);
         }
       }
       return null;
     }
 
-    return `Поле '${fieldName}': неподдерживаемый type='${schemaType}'.`;
+    return uiText("Поле '{0}': неподдерживаемый type='{1}'.", fieldName, schemaType);
   };
 
   for (const key of keys) {
-    if (!key.trim()) return "В Ожидаемом JSON есть пустой ключ.";
+    if (!key.trim()) return uiText("В Ожидаемом JSON есть пустой ключ.");
     const error = validateFieldSchema(key, payload[key]);
     if (error) return error;
   }
@@ -509,6 +562,7 @@ function validateExpectedJsonTemplate(payload: Record<string, unknown>): string 
 function fallbackReadyPreset(
   hint: ReadyPresetId,
 ): { prompt: string; expected: Record<string, unknown> } {
+  if (getUiLanguage() === "en") return englishReadyPreset(hint === "fraud_by_store");
   if (hint === "fraud_individual") {
     return {
       prompt:
@@ -650,9 +704,9 @@ function AllowedValuesInput({ values, onChange }: AllowedValuesInputProps) {
       renderInput={(params) => (
         <TextField
           {...params}
-          label="Допустимые значения"
-          placeholder="Введите значение и нажмите Enter. Можно вставить колонку из Excel."
-          helperText="Enter — добавить. Ctrl+V из Excel или списка через запятую/точку с запятой — каждое значение станет отдельным чипом."
+          label={uiText("Допустимые значения")}
+          placeholder={uiText("Введите значение и нажмите Enter. Можно вставить колонку из Excel.")}
+          helperText={uiText("Enter — добавить. Ctrl+V из Excel или списка через запятую/точку с запятой — каждое значение станет отдельным чипом.")}
           onPaste={handlePaste}
         />
       )}
@@ -660,31 +714,212 @@ function AllowedValuesInput({ values, onChange }: AllowedValuesInputProps) {
   );
 }
 
+/* ──────────── Stage 2 helpers: count-up, SVG ring, log line parser ──────────── */
+
+/**
+ * useAnimatedNumber — плавный tween целевого числа с ease-out cubic.
+ * Возвращает текущее анимируемое значение. При смене target плавно
+ * переходит от текущего показанного к новому за `duration` мс.
+ */
+function useAnimatedNumber(target: number, duration = 600): number {
+  const [display, setDisplay] = useState(target);
+  const fromRef = useRef(target);
+  const startRef = useRef<number | null>(null);
+  const rafRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    fromRef.current = display;
+    startRef.current = null;
+
+    const tick = (now: number) => {
+      if (startRef.current === null) startRef.current = now;
+      const elapsed = now - startRef.current;
+      const t = Math.min(1, elapsed / duration);
+      const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+      const next = fromRef.current + (target - fromRef.current) * eased;
+      setDisplay(next);
+      if (t < 1) {
+        rafRef.current = requestAnimationFrame(tick);
+      }
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target, duration]);
+
+  return display;
+}
+
+function AnimatedNumber({
+  value,
+  format,
+  className,
+  duration = 600,
+}: {
+  value: number;
+  format?: (n: number) => string;
+  className?: string;
+  duration?: number;
+}) {
+  const animated = useAnimatedNumber(value, duration);
+  const text = format
+    ? format(animated)
+    : Math.round(animated).toLocaleString(uiLocale());
+  return <span className={className}>{text}</span>;
+}
+
+type RingStatus = "idle" | "queued" | "running" | "paused" | "completed" | "failed" | "canceled";
+
+/**
+ * RingProgress — SVG-кольцо с центральной подписью и градиентной заливкой.
+ * Цвет заливки выбирается по статусу (warning/success/error/info/inherit).
+ * Гасит motion при prefers-reduced-motion (наследуется от CSS).
+ */
+function RingProgress({
+  percent,
+  size = 152,
+  strokeWidth = 10,
+  status = "idle",
+  centerLabel,
+  centerSubLabel,
+}: {
+  percent: number;
+  size?: number;
+  strokeWidth?: number;
+  status?: RingStatus;
+  centerLabel?: React.ReactNode;
+  centerSubLabel?: React.ReactNode;
+}) {
+  const uid = useId().replace(/:/g, "");
+  const radius = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const clamped = Math.max(0, Math.min(100, percent));
+  const offset = circumference * (1 - clamped / 100);
+
+  const gradId = `ring-grad-${status}-${uid}`;
+  const gradStops: Record<RingStatus, [string, string]> = {
+    running: ["#fb923c", "#ea580c"],
+    paused: ["#fdba74", "#ea580c"],
+    completed: ["#34d399", "#10b981"],
+    failed: ["#f87171", "#dc2626"],
+    queued: ["#60a5fa", "#2563eb"],
+    canceled: ["#cbd5e1", "#94a3b8"],
+    idle: ["#cbd5e1", "#94a3b8"],
+  };
+  const [from, to] = gradStops[status];
+
+  return (
+    <div className={`ring-progress ring-status-${status}`} style={{ width: size, height: size }}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden>
+        <defs>
+          <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor={from} />
+            <stop offset="100%" stopColor={to} />
+          </linearGradient>
+        </defs>
+        <circle
+          className="ring-track"
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={strokeWidth}
+        />
+        <circle
+          className="ring-fill"
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={strokeWidth}
+          stroke={`url(#${gradId})`}
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          transform={`rotate(-90 ${size / 2} ${size / 2})`}
+        />
+      </svg>
+      <div className="ring-center">
+        <div className="ring-main">{centerLabel}</div>
+        {centerSubLabel ? <div className="ring-sub">{centerSubLabel}</div> : null}
+      </div>
+    </div>
+  );
+}
+
+/** Категоризирует строку лога по подстрокам — для цветовой полоски слева. */
+function classifyLogLine(line: string): "info" | "warn" | "error" | "debug" | "default" {
+  const lower = line.toLowerCase();
+  if (/\b(error|err|exception|traceback|critical|fatal|✗)\b/.test(lower)) return "error";
+  if (/\b(warn|warning|⚠)\b/.test(lower)) return "warn";
+  if (/\b(debug|trace)\b/.test(lower)) return "debug";
+  if (/\b(info|started|done|готово|✓|обработано|completed|success)\b/.test(lower)) return "info";
+  return "default";
+}
+
 function App() {
   const [providers, setProviders] = useState<Provider[]>([]);
-  const [models, setModels] = useState<string[]>([]);
-  const [defaultPrompt, setDefaultPrompt] = useState("");
+  const [modelCatalogReady, setModelCatalogReady] = useState(false);
+  const [models, setModels] = useState<ModelChoice[]>([]);
 
   const [user, setUser] = useState<User | null>(null);
+  const [accessState, setAccessState] = useState<AccessState | null>(null);
+  const accessStateRef = useRef<AccessState | null>(null);
+  const activeUserRef = useRef<number | null>(null);
+  const lastUsageStartRef = useRef(-Infinity);
+  const loadUsageRef = useRef<() => Promise<void>>(async () => undefined);
+  const [accessGroupId, setAccessGroupId] = useState<number | "">("");
+  const [requestGroupOpen, setRequestGroupOpen] = useState(false);
+  const [selectedReportMeta, setSelectedReportMeta] = useState<ReportItem | null>(null);
+  const [quotaFailure, setQuotaFailure] = useState<{ message: string; alternative: AccessGroup | null } | null>(null);
+  const [launchError, setLaunchError] = useState("");
+  const quotaSectionRef = useRef<HTMLDivElement>(null);
+  const launchFeedbackRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!quotaFailure && !launchError) return;
+    const frame = requestAnimationFrame(() => revealLaunchElement(launchFeedbackRef.current));
+    return () => cancelAnimationFrame(frame);
+  }, [quotaFailure, launchError]);
+  function failLaunch(message: string) { setError(""); setLaunchError(message); }
+  function showQuota() {
+    requestAnimationFrame(() => revealLaunchElement(quotaSectionRef.current, '[role="combobox"]'));
+  }
+  const quotaGroups = accessState?.groups || [];
+  const quotaBlockMessage = quotaBlockedReason(quotaGroups, accessGroupId);
+  const quotaBlocked = quotaBlockMessage !== null;
+  function applyAccessState(state: AccessState) {
+    rememberPendingRequests(state.requests);
+    const previous = accessStateRef.current;
+    accessStateRef.current = state;
+    setAccessState(state);
+    setAccessGroupId(prev => retainQuotaSelection(previous?.groups ?? null, state.groups, prev, state.last_group_id));
+  }
+  const locationHash = useLocationHash();
+  const canManage = user?.role === "admin" || !!accessState?.is_manager;
+  useEffect(() => {
+    if (user && accessState && !canManage && locationHash.startsWith("#/admin")) navigate("", true);
+  }, [user, accessState, canManage, locationHash]);
+  const [settingsWarnings, setSettingsWarnings] = useState<string[]>([]);
+  const [pendingSettingsPayload, setPendingSettingsPayload] = useState<Record<string, unknown> | null>(null);
+  const [promptPreview, setPromptPreview] = useState<{ messages: Array<{ role: string; content: string }>; response_schema: unknown; truncated: boolean; will_send: boolean } | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [promptFullScreen, setPromptFullScreen] = useState(false);
+  const [reportName, setReportName] = useState("");
+  const [checkedReportIds, setCheckedReportIds] = useState<string[]>([]);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [bulkErrors, setBulkErrors] = useState<Array<{ id: string; message?: string }>>([]);
+  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
 
   const [reports, setReports] = useState<ReportItem[]>([]);
-  const [adminUsers, setAdminUsers] = useState<AdminUserItem[]>([]);
-  const [adminSelectedUserId, setAdminSelectedUserId] = useState<number | "">("");
-  const [adminReports, setAdminReports] = useState<ReportItem[]>([]);
-  const [adminStats, setAdminStats] = useState<AdminStats | null>(null);
-  const [adminLoading, setAdminLoading] = useState(false);
-  const [adminAutoRefresh, setAdminAutoRefresh] = useState(false);
-  const [adminLogService, setAdminLogService] = useState<"all" | "backend" | "worker">("all");
-  const [adminLogLevel, setAdminLogLevel] = useState<"" | "INFO" | "WARNING" | "ERROR">("");
-  const [adminLogQuery, setAdminLogQuery] = useState("");
-  const [adminLogLinesLimit, setAdminLogLinesLimit] = useState(200);
-  const [adminLogs, setAdminLogs] = useState<AdminLogItem[]>([]);
-  const [adminLogsLoading, setAdminLogsLoading] = useState(false);
-  const [adminLogsAutoRefresh, setAdminLogsAutoRefresh] = useState(false);
+  const reportsRef = useRef<ReportItem[]>([]);
+  useEffect(() => { reportsRef.current = reports; }, [reports]);
   const [usage, setUsage] = useState<Usage | null>(null);
   const [presets, setPresets] = useState<UserPreset[]>([]);
   const [presetName, setPresetName] = useState("");
@@ -699,17 +934,20 @@ function App() {
   const [examplesLoading, setExamplesLoading] = useState(false);
   const [exampleLoadingName, setExampleLoadingName] = useState<string | null>(null);
   const [userMenuAnchor, setUserMenuAnchor] = useState<null | HTMLElement>(null);
+  const [rulesOpen, setRulesOpen] = useState(false);
   const [releaseNotesOpen, setReleaseNotesOpen] = useState(false);
   const [releases, setReleases] = useState<ReleaseEntry[]>([]);
   const [releasesLoading, setReleasesLoading] = useState(false);
   const [releasesError, setReleasesError] = useState<string | null>(null);
   const [activeReleaseTab, setActiveReleaseTab] = useState(0);
+  const releaseNotesContentRef = useRef<HTMLDivElement | null>(null);
   const [sheetName, setSheetName] = useState("");
   const [analysisColumns, setAnalysisColumns] = useState<string[]>([]);
   const [nonAnalysisColumns, setNonAnalysisColumns] = useState<string[]>([]);
   const [groupByColumn, setGroupByColumn] = useState("");
 
-  const [provider, setProvider] = useState(() => localStorage.getItem(LAST_PROVIDER_KEY) || "openai");
+  const restoredModelSelection = useRef({ provider: localStorage.getItem(LAST_PROVIDER_KEY), model: localStorage.getItem(LAST_MODEL_KEY) });
+  const [provider, setProvider] = useState(() => localStorage.getItem(LAST_PROVIDER_KEY) || "");
   const [model, setModel] = useState(() => localStorage.getItem(LAST_MODEL_KEY) || "");
   const analysisMode: "custom" = "custom";
   const [apiKey, setApiKey] = useState(sessionStorage.getItem(TOKEN_SESSION_KEY) || "");
@@ -730,10 +968,6 @@ function App() {
   const [templateInfoExpanded, setTemplateInfoExpanded] = useState(false);
   const [showAdvancedSchemaAttrs, setShowAdvancedSchemaAttrs] = useState(false);
 
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [job, setJob] = useState<JobState | null>(null);
-  const [, setStatusLogs] = useState<string[]>([]);
-  const [jobElapsedSec, setJobElapsedSec] = useState(0);
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
   const [selectedReportAnalysis, setSelectedReportAnalysis] = useState<ReportAnalysis | null>(null);
   const [selectedReportLoading, setSelectedReportLoading] = useState(false);
@@ -741,8 +975,6 @@ function App() {
   const resultsBlockRef = useRef<HTMLDivElement | null>(null);
   const scrolledReportIdRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const statusPollRef = useRef<number | null>(null);
   const [showAllReports, setShowAllReports] = useState(false);
   const [error, setError] = useState<string>("");
   const [actionToast, setActionToast] = useState<{ message: string; severity: "success" | "warning" | "error" } | null>(null);
@@ -758,14 +990,19 @@ function App() {
     filename: string;
   } | null>(null);
   const [retryingReportId, setRetryingReportId] = useState<string | null>(null);
-  const [reportsMenuAnchor, setReportsMenuAnchor] = useState<HTMLElement | null>(null);
-  const [isRunning, setIsRunning] = useState(false);
   const [logoSrc, setLogoSrc] = useState<string>(BRAND_LOGO_CANDIDATES[0]);
   const { mode, toggle } = useThemeMode();
-  const JOB_REPORTS_POLL_ACTIVE_MS = 3000;
-  const JOB_REPORTS_POLL_IDLE_MS = 6000;
-  const JOB_STATUS_FALLBACK_POLL_MS = 3000;
-  const USAGE_POLL_MS = 20000;
+  // SSE удалён в v2.1.0 — единственный источник правды теперь polling
+  // /api/reports/active. Active = есть running/queued/paused, idle = только
+  // терминальные. Активный интервал короче, чтобы прогресс-бар выглядел
+  // живым (бэкенд персистит состояние раз в ~1 сек).
+  const JOB_REPORTS_POLL_ACTIVE_MS = 1500;
+  const JOB_REPORTS_POLL_IDLE_MS = 3000;
+  // v2.1.2 (BUG-26): интервал поднят с 20 → 60 сек, чтобы не дёргать
+  // get_user_usage (тяжёлый SUM по партициям report_rows). В паре с
+  // Redis-кэшем 300 сек нагрузка на PG падает с ~60 SQL/мин до ~4 SQL/мин
+  // на 20 активных юзерах.
+  const USAGE_POLL_MS = 60000;
   const REPORTS_MIN_REFRESH_GAP_MS = 1500;
   const ACTIVE_REPORTS_MIN_REFRESH_GAP_MS = 2000;
   const reportsLoadInFlightRef = useRef(false);
@@ -823,17 +1060,17 @@ function App() {
     for (const field of fields) {
       const trimmed = field.name.trim();
       if (!trimmed) {
-        setSchemaBuilderError("У каждого поля должно быть заполнено название.");
+        setSchemaBuilderError(uiText("У каждого поля должно быть заполнено название."));
         return false;
       }
       if (names.has(trimmed)) {
-        setSchemaBuilderError(`Названия полей должны быть уникальны. Повтор: '${trimmed}'.`);
+        setSchemaBuilderError(uiText("Названия полей должны быть уникальны. Повтор: '{0}'.", trimmed));
         return false;
       }
       names.add(trimmed);
       if (field.type === "list" && field.listSingle && field.listValues.length === 0) {
         setSchemaBuilderError(
-          `Поле '${trimmed}': для списка с одним значением нужно заполнить допустимые значения.`,
+          uiText("Поле '{0}': для списка с одним значением нужно заполнить допустимые значения.", trimmed),
         );
         return false;
       }
@@ -861,21 +1098,6 @@ function App() {
     setActionToast(null);
   }
 
-  function nowTsLabel(): string {
-    return new Date().toLocaleTimeString("ru-RU", { hour12: false });
-  }
-
-  function stopJobTracking() {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
-    if (statusPollRef.current !== null) {
-      window.clearInterval(statusPollRef.current);
-      statusPollRef.current = null;
-    }
-  }
-
   async function verifyToken() {
     if (provider !== "openai") return;
     setTokenVerifyLoading(true);
@@ -884,7 +1106,7 @@ function App() {
       const result = await api.verifyProviderToken(provider, apiKey.trim() ? apiKey : null);
       setTokenVerifyResult(result);
       if (!result.ok) {
-        setError(result.message || `Проверка токена: HTTP ${result.status_code}`);
+        setError(result.message || uiText("Проверка токена: HTTP {0}", result.status_code));
       }
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : String(exc));
@@ -896,16 +1118,14 @@ function App() {
   async function loadBaseData() {
     const [providerList, promptData] = await Promise.all([api.getProviders(), api.getDefaultPrompt()]);
     setProviders(providerList);
+    setModelCatalogReady(true);
     if (providerList.length > 0) {
-      const available = new Set(providerList.map((item) => item.id));
-      if (!available.has(provider)) {
-        const preferred = providerList.find((item) => item.id === "openai")?.id || providerList[0]?.id || "";
-        if (preferred) {
-          setProvider(preferred);
-        }
-      }
+      const saved = restoredModelSelection.current;
+      const choices = saved.provider && providerList.some(p => p.id === saved.provider)
+        ? await api.getModels(saved.provider) : [];
+      if (!choices.some(m => m.model === saved.model)) localStorage.removeItem(LAST_MODEL_KEY);
+      setProvider(restoreProvider(providerList, saved.provider, saved.model, choices));
     }
-    setDefaultPrompt(promptData.promptTemplate);
     setParallelismMax(promptData.parallelismMax);
     setParallelism((prev) => Math.max(1, Math.min(promptData.parallelismMax, prev)));
     if (!promptEditorValue.trim()) {
@@ -934,6 +1154,7 @@ function App() {
 
   function refreshReportsClick() {
     void loadReports(true);
+    void loadUsage();
   }
 
   async function loadActiveReports(force = false) {
@@ -947,22 +1168,23 @@ function App() {
       const activeRows = await api.getActiveReports();
       const activeById = new Map(activeRows.map((row) => [row.id, row]));
       const activeIds = new Set(activeRows.map((row) => row.id));
-      let shouldReloadFull = false;
+      const shouldReloadFull = reportsRef.current.some(row =>
+        ["running", "queued", "paused"].includes(row.status) && !activeIds.has(row.id));
 
       setReports((prev) => {
-        const prevActiveIds = prev
-          .filter((row) => row.status === "running" || row.status === "queued" || row.status === "paused")
-          .map((row) => row.id);
-        shouldReloadFull = prevActiveIds.some((id) => !activeIds.has(id));
-
         const next = prev.map((row) => {
           const fresh = activeById.get(row.id);
           if (!fresh) return row;
           return {
             ...row,
             ...fresh,
-            // Keep heavy JSON fields from the full list endpoint.
-            summary_json: row.summary_json,
+            // Тяжёлые JSON-поля (схемы, колонки) light-ручка зануляет — берём
+            // их из row (они не меняются после старта отчёта).
+            // summary_json: light-ручка ТЕПЕРЬ возвращает живой summary
+            // (worker обновляет в БД каждые JOB_EVENTS_FALLBACK_POLL_SEC),
+            // поэтому используем fresh.summary_json если он не null,
+            // иначе fallback на row.summary_json (например, для свежезагруженного отчёта).
+            summary_json: fresh.summary_json ?? row.summary_json,
             output_schema_json: row.output_schema_json,
             expected_json_template_json: row.expected_json_template_json,
             input_columns_json: row.input_columns_json,
@@ -976,6 +1198,7 @@ function App() {
 
       if (shouldReloadFull) {
         await loadReports(true);
+        void loadUsage();
       }
     } catch {
       // no-op
@@ -1001,96 +1224,76 @@ function App() {
   }
 
   async function loadUsage() {
+    const actorId = activeUserRef.current;
+    if (actorId === null) return;
+    lastUsageStartRef.current = performance.now();
     try {
-      const data = await api.usage();
+      const [data, state] = await Promise.all([api.usage(), accessCall<AccessState>("/access/status")]);
+      if (actorId !== activeUserRef.current) return;
+      const gainedAccess = accessStateRef.current?.has_access === false && state.has_access;
       setUsage(data);
+      setUser(previous => previous && previous.role !== state.role ? { ...previous, role: state.role } : previous);
+      applyAccessState(state);
+      if (gainedAccess) await Promise.all([loadBaseData(), loadReports(true), loadPresets()]);
     } catch {
-      // no-op
+      // Следующий опрос повторит обновление статуса.
     }
   }
+  loadUsageRef.current = loadUsage;
 
-  async function loadAdminOverview() {
-    setAdminLoading(true);
-    try {
-      const [usersData, statsData] = await Promise.all([api.adminUsers(), api.adminStats()]);
-      setAdminUsers(usersData);
-      setAdminStats(statsData);
-      setAdminSelectedUserId((prev) => {
-        if (typeof prev === "number" && usersData.some((u) => u.id === prev)) return prev;
-        return usersData[0]?.id ?? "";
-      });
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setAdminLoading(false);
-    }
+  async function enterWorkspace(me: User) {
+    const state = await accessCall<AccessState>("/access/status");
+    activeUserRef.current = me.id;
+    rememberPendingRequests(state.requests);
+    accessStateRef.current = state;
+    setAccessState(state);
+    setUser({ ...me, role: state.role });
+    setAccessGroupId(chooseQuota(state.groups, state.last_group_id));
+    if (!state.has_access) return;
+    await loadBaseData();
+    await loadReports();
+    await loadUsage();
+    await loadPresets();
   }
 
-  async function loadAdminReports(targetUserId: number) {
-    setAdminLoading(true);
+  async function doAuth() {
+    setError("");
+    setAuthLoading(true);
     try {
-      const rows = await api.adminUserReports(targetUserId, 50);
-      setAdminReports(rows);
-    } catch (e) {
-      setError((e as Error).message);
+      if (authMode === "register") await api.register(authUsername, authPassword);
+      else await api.login(authUsername, authPassword);
+      setAuthPassword("");
+      await enterWorkspace(await api.me());
+    } catch (error) {
+      setError((error as Error).message);
     } finally {
-      setAdminLoading(false);
-    }
-  }
-
-  async function loadAdminLogs() {
-    setAdminLogsLoading(true);
-    try {
-      const lines = await api.adminLogs(adminLogService, adminLogLinesLimit, adminLogLevel || undefined, adminLogQuery || undefined);
-      setAdminLogs(lines);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setAdminLogsLoading(false);
+      setAuthLoading(false);
     }
   }
 
   useEffect(() => {
     async function bootstrap() {
-      try {
-        await loadBaseData();
-      } catch (e) {
-        setError((e as Error).message);
-        return;
+      const params = new URLSearchParams(window.location.search);
+      if (params.has("sso_error")) {
+        setError(uiText("Вход через SSO не удался. Попробуйте ещё раз."));
+        params.delete("sso_error");
+        const query = params.toString();
+        window.history.replaceState({}, "", window.location.pathname + (query ? `?${query}` : "") + window.location.hash);
       }
-
       try {
-        const me = await api.me();
-        setUser(me);
-        await loadReports();
-        await loadUsage();
-        await loadPresets();
-        if (me.role === "admin") {
-          await loadAdminOverview();
-          await loadAdminLogs();
-        }
-      } catch {
-        // Not authenticated yet is an expected state on fresh load.
+        setAuthConfig(await api.getAuthConfig());
+      } catch (error) {
+        setError((error as Error).message);
+      }
+      try {
+        await enterWorkspace(await api.me());
+      } catch (error) {
+        if (!(error instanceof APIError && error.status === 401)) setError((error as Error).message);
       }
     }
 
-    bootstrap();
-    return () => {
-      stopJobTracking();
-    };
+    void bootstrap();
   }, []);
-
-  useEffect(() => {
-    if (!isRunning) {
-      setJobElapsedSec(0);
-      return;
-    }
-    const startedAt = Date.now();
-    const timer = window.setInterval(() => {
-      setJobElapsedSec(Math.floor((Date.now() - startedAt) / 1000));
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [isRunning, jobId]);
 
   const hasActiveReports = useMemo(
     () => reports.some((r) => r.status === "running" || r.status === "queued" || r.status === "paused"),
@@ -1116,51 +1319,42 @@ function App() {
   }, [user]);
 
   useEffect(() => {
-    if (user?.role !== "admin") return;
-    if (typeof adminSelectedUserId !== "number") {
-      setAdminReports([]);
-      return;
-    }
-    loadAdminReports(adminSelectedUserId);
-  }, [adminSelectedUserId, user?.role]);
+    if (!user) return;
+    const refresh = createFocusAccessRefresh(() => loadUsageRef.current(), { lastLoad: () => lastUsageStartRef.current });
+    const onReturn = () => { refresh(document.visibilityState === "visible"); };
+    window.addEventListener("focus", onReturn);
+    document.addEventListener("visibilitychange", onReturn);
+    return () => {
+      window.removeEventListener("focus", onReturn);
+      document.removeEventListener("visibilitychange", onReturn);
+    };
+  }, [user?.id]);
 
   useEffect(() => {
-    if (user?.role !== "admin" || !adminAutoRefresh) return;
-    const timer = window.setInterval(() => {
-      loadAdminOverview();
-      if (typeof adminSelectedUserId === "number") {
-        loadAdminReports(adminSelectedUserId);
-      }
-    }, 5000);
-    return () => window.clearInterval(timer);
-  }, [adminAutoRefresh, adminSelectedUserId, user?.role]);
-
-  useEffect(() => {
-    if (user?.role !== "admin" || !adminLogsAutoRefresh) return;
-    const timer = window.setInterval(() => {
-      loadAdminLogs();
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [adminLogsAutoRefresh, adminLogService, adminLogLevel, adminLogQuery, adminLogLinesLimit, user?.role]);
-
-  useEffect(() => {
+    let active = true;
     async function loadModels() {
+      if (!user || !accessState?.has_access) return;
       try {
+        const available = await api.getProviders();
+        if (!active) return;
+        setProviders(available); setModelCatalogReady(true);
+        if (!available.length) { setModels([]); setModel(""); setProvider(""); return; }
+        const nextProvider = available.some(p => p.id === provider) ? provider : available[0].id;
+        if (nextProvider !== provider) { setProvider(nextProvider); return; }
         const modelsList = await api.getModels(provider);
+        if (!active) return;
         setModels(modelsList);
         const saved = localStorage.getItem(LAST_MODEL_KEY);
-        if (saved && modelsList.includes(saved)) {
-          setModel(saved);
-        } else {
-          setModel(modelsList[0] || "");
-        }
+        setModel(chooseModel(modelsList, saved));
       } catch (e) {
-        setError((e as Error).message);
+        if (active) setError((e as Error).message);
       }
     }
 
-    loadModels();
-  }, [provider]);
+    void loadModels();
+    const timer = window.setInterval(() => void loadModels(), 20000);
+    return () => { active = false; clearInterval(timer); };
+  }, [provider, user?.id, accessState?.has_access, locationHash.startsWith("#/admin")]);
 
   useEffect(() => {
     if (provider === "openai") setParallelism(3);
@@ -1184,21 +1378,6 @@ function App() {
     return sheet?.columns || [];
   }, [fileInfo, sheetName]);
 
-  const sortedAdminLogs = useMemo(() => {
-    const withIndex = adminLogs.map((item, idx) => ({ item, idx }));
-    withIndex.sort((a, b) => {
-      const ta = Date.parse(a.item.ts || "");
-      const tb = Date.parse(b.item.ts || "");
-      const aValid = Number.isFinite(ta);
-      const bValid = Number.isFinite(tb);
-      if (aValid && bValid) return tb - ta; // newest first
-      if (aValid) return -1;
-      if (bValid) return 1;
-      return b.idx - a.idx;
-    });
-    return withIndex.map((x) => x.item);
-  }, [adminLogs]);
-
   const selectedSheetRows = useMemo(() => {
     const sheet = fileInfo?.sheets.find((item) => item.name === sheetName);
     return sheet?.total_rows || 0;
@@ -1221,50 +1400,22 @@ function App() {
     });
   }, [selectedSheetRows]);
 
-  async function doAuth() {
-    setAuthLoading(true);
-    setError("");
-    try {
-      await (authMode === "login"
-        ? await api.login(authUsername, authPassword)
-        : await api.register(authUsername, authPassword));
-      const me = await api.me();
-      setUser(me);
-      await loadReports();
-      await loadUsage();
-      await loadPresets();
-      if (me.role === "admin") {
-        await loadAdminOverview();
-        await loadAdminLogs();
-      }
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setAuthLoading(false);
-    }
-  }
-
   async function doLogout() {
+    activeUserRef.current = null; accessStateRef.current = null; lastUsageStartRef.current = -Infinity;
     try {
       await api.logout();
     } catch {
       // ignore
     }
+    setRulesOpen(false);
+    setAuthMode("login");
     setUser(null);
+    setAccessState(null); setAccessGroupId(""); setSelectedReportMeta(null);
+    setQuotaFailure(null); setLaunchError(""); setRequestGroupOpen(false);
     setReports([]);
-    setAdminUsers([]);
-    setAdminReports([]);
-    setAdminStats(null);
-    setAdminSelectedUserId("");
-    setAdminLogs([]);
-    setAdminAutoRefresh(false);
-    setAdminLogsAutoRefresh(false);
     setPresets([]);
-    setJob(null);
-    setJobId(null);
     setSelectedReportId(null);
     setSelectedReportAnalysis(null);
-    setStatusLogs([]);
   }
 
   async function openReleaseNotes() {
@@ -1277,11 +1428,41 @@ function App() {
       setReleases(list);
       setActiveReleaseTab(0);
     } catch (err) {
-      setReleasesError(err instanceof Error ? err.message : String(err));
+      setReleasesError(releaseNotesErrorMessage(err instanceof APIError ? err.status : undefined));
     } finally {
       setReleasesLoading(false);
     }
   }
+
+  // Закрытие диалога «Заметки о релизе» — единая точка чтобы зафиксировать
+  // в localStorage что текущую версию пользователь уже видел. Иначе после
+  // обновления приложения мы автоматически откроем диалог при следующем входе.
+  function closeReleaseNotes() {
+    setReleaseNotesOpen(false);
+    try {
+      localStorage.setItem(RELEASE_NOTES_SEEN_VERSION_KEY, APP_VERSION);
+    } catch {
+      // localStorage может быть недоступен (приватный режим, переполнение) —
+      // в этом случае просто покажем диалог снова при следующем входе.
+    }
+  }
+
+  // Автооткрытие «Заметок о релизе» один раз на пользователя после апдейта.
+  // Триггер — успешная авторизация (появление user). Сравниваем APP_VERSION
+  // c сохранённым `seen_version` в localStorage; если они расходятся —
+  // приложение обновилось с момента последнего посещения, показываем
+  // диалог. closeReleaseNotes зафиксирует факт показа.
+  useEffect(() => {
+    if (!user || !accessState?.has_access || releaseNotesOpen) return;
+    let seen: string | null = null;
+    try {
+      seen = localStorage.getItem(RELEASE_NOTES_SEEN_VERSION_KEY);
+    } catch {
+      return;
+    }
+    if (shouldAutoShowRelease(!!user, !!accessState?.has_access, releaseNotesOpen, seen, APP_VERSION)) void openReleaseNotes();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, accessState?.has_access]);
 
   async function openExamples() {
     setExamplesOpen(true);
@@ -1318,14 +1499,15 @@ function App() {
 
   async function handleFileUpload(file?: File) {
     if (!file) return;
+    setReportName(file.name.replace(/\.[^/.]+$/, "").slice(0, 200));
     setError("");
     setFileInspectStatus("queued");
-    setFileInspectMessage("Файл загружен. Подготавливаем структуру Excel...");
+    setFileInspectMessage(uiText("Файл загружен. Подготавливаем структуру..."));
     try {
       const applyReadyInfo = (info: FileInspectResponse) => {
         setFileInfo(info);
         setFileInspectStatus("ready");
-        setFileInspectMessage("Файл готов. Выберите колонки и запустите анализ.");
+        setFileInspectMessage(uiText("Файл готов. Выберите колонки и запустите анализ."));
         const nextSheet = info.suggested_sheet || info.sheets[0]?.name || "";
         const suggested = info.suggested_column || info.sheets[0]?.columns[0] || "";
         setSheetName(nextSheet);
@@ -1350,20 +1532,20 @@ function App() {
         const status = String(current.inspect_status || "queued").toLowerCase();
         if (status === "parsing") {
           setFileInspectStatus("parsing");
-          setFileInspectMessage("Читаем Excel и определяем листы/колонки...");
+            setFileInspectMessage(uiText("Читаем файл и определяем колонки..."));
         } else if (status === "queued") {
           setFileInspectStatus("queued");
-          setFileInspectMessage("Файл в очереди на подготовку...");
+          setFileInspectMessage(uiText("Файл в очереди на подготовку..."));
         }
         if (current.inspect_status === "error") {
-          throw new Error(current.inspect_error_text || "Ошибка подготовки файла.");
+          throw new Error(current.inspect_error_text || uiText("Ошибка подготовки файла."));
         }
         if (current.inspect_status === "ready") {
           applyReadyInfo(current);
           return;
         }
       }
-      throw new Error("Подготовка файла заняла слишком много времени. Попробуйте позже.");
+      throw new Error(uiText("Подготовка файла заняла слишком много времени. Попробуйте позже."));
     } catch (e) {
       setError((e as Error).message);
       setFileInfo(null);
@@ -1403,9 +1585,6 @@ function App() {
       if (prev.includes(groupByColumn)) return prev;
       return [...prev, groupByColumn];
     });
-    // При группировке справочные колонки недоступны: значения внутри группы
-    // могут различаться, агрегировать нечем — сбрасываем список целиком.
-    setNonAnalysisColumns([]);
   }, [groupByColumn]);
 
   function onDrop(event: React.DragEvent<HTMLDivElement>) {
@@ -1416,28 +1595,31 @@ function App() {
   }
 
   async function startAnalysis() {
+    setQuotaFailure(null); setLaunchError("");
     if (!fileInfo) {
-      setError("Сначала загрузите файл Excel.");
+      failLaunch(uiText("Сначала загрузите файл XLSX или CSV."));
       return;
     }
+    if (quotaBlocked) { failLaunch(uiText("Выберите группу с доступной квотой.")); return; }
+    setQuotaFailure(null);
     const promptTemplate = promptEditorValue.trim();
     const expectedJsonTemplate = expectedJsonObject;
 
     if (!promptTemplate) {
-      setError("Промпт не должен быть пустым.");
+      failLaunch(uiText("Промпт не должен быть пустым."));
       return;
     }
-    if (!validateSchemaBuilder(schemaFields)) return;
+    if (!validateSchemaBuilder(schemaFields)) { failLaunch(uiText("Проверьте поля ответа перед запуском.")); return; }
 
     const effectiveAnalysisColumns = analysisColumns;
     if (!effectiveAnalysisColumns.length) {
-      setError("Выберите хотя бы одну колонку для анализа.");
+      failLaunch(uiText("Выберите хотя бы одну колонку для анализа."));
       return;
     }
-    const effectiveNonAnalysisColumns = groupByColumn ? [] : nonAnalysisColumns;
+    const effectiveNonAnalysisColumns = nonAnalysisColumns;
     const parsedMaxReviews = Math.floor(Number(maxReviewsInput));
     if (!Number.isFinite(parsedMaxReviews) || parsedMaxReviews < 1) {
-      setError("Лимит отзывов должен быть целым числом от 1.");
+      failLaunch(uiText("Лимит отзывов должен быть целым числом от 1."));
       return;
     }
     // Do not hard-cap by inspect total_rows here: for very large files
@@ -1445,11 +1627,11 @@ function App() {
     const effectiveMaxReviews = parsedMaxReviews;
     const validationError = validateExpectedJsonTemplate(expectedJsonTemplate);
     if (validationError) {
-      setError(validationError);
+      failLaunch(validationError);
       return;
     }
     if (!providers.some((item) => item.id === provider)) {
-      setError("Провайдер недоступен. Обновите список провайдеров.");
+      failLaunch(uiText("Провайдер недоступен. Обновите список провайдеров."));
       return;
     }
     if (rememberToken) {
@@ -1458,39 +1640,13 @@ function App() {
       sessionStorage.removeItem(TOKEN_SESSION_KEY);
     }
 
-    setError("");
-    setStatusLogs([
-      `[${nowTsLabel()}] Отправляем задачу на сервер`,
-      `[${nowTsLabel()}] Подготовка данных: ожидаем подтверждение запуска`,
-    ]);
-    setJob(null);
+    failLaunch("");
     setSelectedReportId(null);
     setSelectedReportAnalysis(null);
-    stopJobTracking();
-    setJobElapsedSec(0);
-    setIsRunning(true);
-    setJob({
-      job_id: "pending",
-      status: "queued",
-      created_at: new Date().toISOString(),
-      started_at: null,
-      finished_at: null,
-      total: 0,
-      processed: 0,
-      progress_percent: 0,
-      eta_seconds: null,
-      current_step: "Подготовка данных: отправка задачи",
-      logs: [],
-      result: {
-        summary: null,
-        preview_rows: [],
-        results_file: null,
-        raw_file: null,
-      },
-    });
 
-    try {
-      const newJobId = await api.startJob({
+    await launchWithPayload({
+        name: reportName.trim() || null,
+        access_group_id: accessGroupId || null,
         file_id: fileInfo.file_id,
         sheet_name: sheetName,
         provider,
@@ -1509,158 +1665,64 @@ function App() {
         save_api_key_for_resume: provider === "openai" ? saveApiKeyForResume : false,
         include_raw_json: true,
       });
-      setJobId(newJobId);
+  }
+
+  async function launchWithPayload(payload: Record<string, unknown>) {
+    try {
+      const newJobId = await api.startJob(payload);
+      // newJobId совпадает с reportId — выбираем созданный отчёт сразу,
+      // чтобы блок «3. Обработка» начал отображать прогресс из polling.
       setSelectedReportId(newJobId);
-      setJob((prev) =>
-        prev
-          ? {
-              ...prev,
-              job_id: newJobId,
-              current_step: "Подготовка данных: задача создана, ждём первые события",
-            }
-          : prev,
-      );
-      subscribeToEvents(newJobId);
-      await loadReports();
+      // Принудительный рефреш списков: отчёт появится в «Мои отчёты» и в
+      // selectedLaunchReport мгновенно, без ожидания периодического тика.
+      await loadReports(true);
+      void loadActiveReports(true);
     } catch (e) {
-      setIsRunning(false);
-      stopJobTracking();
-      setError((e as Error).message);
+      if (e instanceof APIError && e.detail?.code === "limit_exhausted") {
+        const state = await accessCall<AccessState>("/access/status").catch(() => accessState);
+        if (state) applyAccessState(state);
+        const failedId = Number(e.detail.group_id || payload.access_group_id);
+        setQuotaFailure({ message: e.message, alternative: state?.groups.find(g => g.id !== failedId && quotaAvailable(g)) || null });
+        setError(""); setLaunchError(""); return;
+      }
+      if (e instanceof APIError && e.detail?.code === "settings_warning") {
+        setPendingSettingsPayload(payload);
+        setSettingsWarnings((e.detail.fields as string[]) || []);
+        return;
+      }
+      failLaunch((e as Error).message);
     }
   }
 
-  function subscribeToEvents(activeJobId: string) {
-    stopJobTracking();
-    // Сразу подтягиваем актуальный job, чтобы блок «3. Обработка» не висел на
-    // «Ожидание запуска / Ожидание». SSE-обработчик ниже делает setJob((prev)=>prev)
-    // при null — без инициализации статусы бы никогда не применились.
-    (async () => {
-      try {
-        const initial = await api.getJob(activeJobId);
-        setJob(initial);
-        setJobId(activeJobId);
-        if (Array.isArray(initial.logs) && initial.logs.length) {
-          setStatusLogs(initial.logs.map((item) => String(item)));
-        }
-      } catch {
-        // ignore: SSE заработает как только воркер стартанёт
-      }
-    })();
-    const eventSource = new EventSource(api.jobEventsUrl(activeJobId), { withCredentials: true });
-    eventSourceRef.current = eventSource;
+  async function resolveSettings(choice: "passthrough" | "analysis" | "keep") {
+    if (!pendingSettingsPayload) return;
+    const next: Record<string, unknown> = { ...pendingSettingsPayload, settings_confirmed: true };
+    if (choice === "analysis") {
+      const columns = Array.from(new Set([...(next.analysis_columns as string[]), ...settingsWarnings]));
+      next.analysis_columns = columns; setAnalysisColumns(columns);
+    }
+    if (choice === "passthrough") {
+      const columns = Array.from(new Set([...(next.non_analysis_columns as string[] || []), ...settingsWarnings]));
+      next.non_analysis_columns = columns; setNonAnalysisColumns(columns);
+    }
+    setPendingSettingsPayload(null); setSettingsWarnings([]);
+    await launchWithPayload(next);
+  }
 
-    const hydrateCompletedReportAnalysis = async () => {
-      try {
-        const analysis = await api.getReportAnalysis(activeJobId);
-        setSelectedReportId(activeJobId);
-        setSelectedReportAnalysis(analysis);
-      } catch {
-        // ignore: fallback to report open action
-      }
-    };
-
-    const stopPolling = () => {
-      if (statusPollRef.current !== null) {
-        window.clearInterval(statusPollRef.current);
-        statusPollRef.current = null;
-      }
-    };
-    const isTerminal = (status: string | undefined): boolean => status === "completed" || status === "failed" || status === "canceled";
-
-    const startFallbackPolling = () => {
-      if (statusPollRef.current !== null) return;
-      statusPollRef.current = window.setInterval(async () => {
-        try {
-          const latest = await api.getJob(activeJobId);
-          setJob(latest);
-          if (Array.isArray(latest.logs) && latest.logs.length) {
-            setStatusLogs(latest.logs.map((item) => String(item)));
-          }
-          if (isTerminal(latest.status)) {
-            stopPolling();
-            setIsRunning(false);
-            await loadReports();
-            if (latest.status === "completed") {
-              await hydrateCompletedReportAnalysis();
-            }
-          }
-        } catch {
-          // keep fallback polling silently
-        }
-      }, JOB_STATUS_FALLBACK_POLL_MS);
-    };
-
-    eventSource.onmessage = async (message) => {
-      const event = JSON.parse(message.data) as SseEvent;
-      const payloadStatus = typeof event.payload.status === "string" ? event.payload.status : null;
-      const payloadProcessed = typeof event.payload.processed === "number" ? event.payload.processed : null;
-      const payloadTotal = typeof event.payload.total === "number" ? event.payload.total : null;
-      const payloadEta = typeof event.payload.eta_seconds === "number" ? event.payload.eta_seconds : null;
-      const payloadStep = typeof event.payload.current_step === "string" ? event.payload.current_step : null;
-      const payloadMessage = typeof event.payload.message === "string" ? event.payload.message : null;
-      const payloadLogs = event.payload.logs;
-
-      if (payloadStatus || payloadProcessed !== null || payloadTotal !== null || payloadStep || payloadEta !== null) {
-        setJob((prev) => {
-          if (!prev) return prev;
-          const processed = payloadProcessed ?? prev.processed;
-          const total = payloadTotal ?? prev.total;
-          const progressPercent = total > 0 ? Math.round((processed / total) * 10000) / 100 : prev.progress_percent;
-          return {
-            ...prev,
-            status: (payloadStatus as typeof prev.status | null) ?? prev.status,
-            processed,
-            total,
-            progress_percent: progressPercent,
-            eta_seconds: payloadEta ?? prev.eta_seconds,
-            current_step: payloadStep ?? prev.current_step,
-          };
-        });
-        // Keep "Мои отчеты" visually fresh even with throttled full refreshes.
-        void loadActiveReports();
-      }
-      if (payloadMessage) {
-        setStatusLogs((prev) => [...prev.slice(-18), `[${nowTsLabel()}] ${payloadMessage}`]);
-      }
-      if (Array.isArray(payloadLogs)) {
-        setStatusLogs(payloadLogs.map((item) => String(item)));
-      }
-
-      if (event.type === "done" || event.type === "error") {
-        stopPolling();
-        eventSource.close();
-        eventSourceRef.current = null;
-        const latest = await api.getJob(activeJobId);
-        setJob(latest);
-        setIsRunning(false);
-        await loadReports(true);
-        if (event.type === "done") {
-          await hydrateCompletedReportAnalysis();
-        }
-        if (event.type === "error") {
-          setError(String(event.payload.message || "Ошибка обработки"));
-        }
-      }
-
-      if (payloadStatus && isTerminal(payloadStatus)) {
-        stopPolling();
-        eventSource.close();
-        eventSourceRef.current = null;
-        const latest = await api.getJob(activeJobId);
-        setJob(latest);
-        setIsRunning(false);
-        await loadReports(true);
-        if (payloadStatus === "completed") {
-          await hydrateCompletedReportAnalysis();
-        }
-      }
-    };
-
-    eventSource.onerror = () => {
-      eventSource.close();
-      eventSourceRef.current = null;
-      startFallbackPolling();
-    };
+  async function showPromptPreview() {
+    if (!fileInfo) { setError(uiText("Сначала загрузите XLSX или CSV")); return; }
+    setPreviewLoading(true); setError("");
+    try {
+      const result = await accessCall<NonNullable<typeof promptPreview>>("/jobs/preview-prompt", "POST", {
+        prompt_language: getUiLanguage(),
+        file_id: fileInfo.file_id, sheet_name: sheetName, analysis_columns: analysisColumns,
+        non_analysis_columns: nonAnalysisColumns, group_by_column: groupByColumn || null,
+        provider, model, prompt_template: promptEditorValue.trim(), analysis_mode: analysisMode,
+        expected_json_template: expectedJsonObject, max_reviews: Math.max(1, Number(maxReviewsInput) || 100),
+        parallelism, temperature,
+      });
+      setPromptPreview(result);
+    } catch (e) { setError((e as Error).message); } finally { setPreviewLoading(false); }
   }
 
   async function cancelAnalysis() {
@@ -1668,39 +1730,45 @@ function App() {
     if (!activeJobId) return;
     try {
       await api.cancelJob(activeJobId);
-      const latest = await api.getJob(activeJobId);
-      setJobId(activeJobId);
-      setJob(latest);
-      setIsRunning(false);
-      stopJobTracking();
-      setActionToast({ message: "Задача отменена.", severity: "error" });
+      setActionToast({ message: uiText("Задача отменена."), severity: "error" });
       await loadReports(true);
+      void loadActiveReports(true);
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
+  async function deleteCheckedReports() {
+    if (!checkedReportIds.length || !window.confirm(uiText("Удалить выбранные отчёты ({0})? Данные использования сохранятся.", checkedReportIds.length))) return;
+    setBulkDeleting(true); setBulkErrors([]);
+    try {
+      const result = await api.bulkDeleteReports(checkedReportIds);
+      const failures = result.results.filter(r => r.status === "error");
+      setBulkErrors(failures);
+      setCheckedReportIds(failures.map(r => r.id));
+      if (selectedReportId && result.results.some(r => r.id === selectedReportId && r.status === "deleted")) {
+        setSelectedReportId(null); setSelectedReportAnalysis(null);
+      }
+      await loadReports(true); await loadUsage();
+      setActionToast({ message: uiText("Удалено: {0}. Ошибок: {1}.", result.deleted, result.failed), severity: result.failed ? "warning" : "success" });
+    } catch (e) { setError((e as Error).message); } finally { setBulkDeleting(false); }
+  }
+
   async function handleReportAction(jobIdValue: string, action: "pause" | "resume" | "cancel") {
     setError("");
+    setQuotaFailure(null); setLaunchError("");
     try {
       if (action === "pause") await api.pauseJob(jobIdValue);
       if (action === "resume") await api.resumeJob(jobIdValue);
       if (action === "cancel") await api.cancelJob(jobIdValue);
-      if (action === "pause") setActionToast({ message: "Задача поставлена на паузу.", severity: "warning" });
-      if (action === "resume") setActionToast({ message: "Задача запущена.", severity: "success" });
-      if (action === "cancel") setActionToast({ message: "Задача отменена.", severity: "error" });
+      if (action === "pause") setActionToast({ message: uiText("Задача поставлена на паузу."), severity: "warning" });
+      if (action === "resume") setActionToast({ message: uiText("Задача запущена."), severity: "success" });
+      if (action === "cancel") setActionToast({ message: uiText("Задача отменена."), severity: "error" });
 
-      const latest = await api.getJob(jobIdValue);
-      setJobId(jobIdValue);
-      setJob(latest);
-      if (latest.status === "running" || latest.status === "queued") {
-        setIsRunning(true);
-        subscribeToEvents(jobIdValue);
-      } else {
-        setIsRunning(false);
-        stopJobTracking();
-      }
+      // Polling /api/reports/active заберёт свежий статус через ~1.5 сек —
+      // принудительный рефреш делает это мгновенно для лучшего UX.
       await loadReports(true);
+      void loadActiveReports(true);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1711,25 +1779,22 @@ function App() {
     setSelectedReportLoading(true);
     setSelectedReportLoadingId(reportId);
     try {
-      const analysis = await api.getReportAnalysis(reportId);
+      const [analysis, meta] = await Promise.all([api.getReportAnalysis(reportId), accessCall<ReportItem>(`/reports/${reportId}`)]);
+      setSelectedReportMeta(meta);
       setSelectedReportId(reportId);
       setSelectedReportAnalysis(analysis);
-      setStatusLogs([]);
-      // Если отчёт всё ещё активен (running/queued/paused) — подписываемся на SSE,
-      // чтобы блок «3. Обработка» показывал живой прогресс и статус. Для paused SSE
-      // не шлёт событий, но subscribeToEvents сразу подтягивает job через
-      // api.getJob() — этого достаточно, чтобы текст обновился.
-      // Для терминальных (completed/failed/canceled) — чистим состояние как раньше.
-      const reportRow = reports.find((r) => r.id === reportId);
-      const activeStatus = reportRow?.status || "";
-      if (["running", "queued", "paused"].includes(activeStatus) && reportRow?.job_id) {
-        subscribeToEvents(reportRow.job_id);
-      } else {
-        setJob(null);
-        setJobId(null);
-        setIsRunning(false);
-        stopJobTracking();
-      }
+      // Принудительный рефреш активных отчётов — selectedLaunchReport
+      // мгновенно подтянется из обновлённого reports[] для блоков 3/4.
+      void loadActiveReports(true);
+      // Каждый клик «Открыть» — это явный пользовательский intent проскроллить
+      // к блоку «3/4». useEffect ниже скроллит только один раз на смену
+      // selectedReportId и пропускает повторные клики по тому же отчёту
+      // (защита от джёрка во время live-polling). Здесь — принудительно
+      // на каждый клик; requestAnimationFrame ждёт пока DOM отрисуется
+      // с новым analysis.
+      requestAnimationFrame(() => {
+        resultsBlockRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -1739,18 +1804,11 @@ function App() {
   }
 
   async function deleteReport(reportId: string) {
-    if (!window.confirm("Удалить отчет без возможности восстановления?")) return;
+    if (!window.confirm(uiText("Удалить отчет без возможности восстановления?"))) return;
     setError("");
     try {
       await api.deleteReport(reportId);
-      setActionToast({ message: "Отчет удален.", severity: "error" });
-      if (jobId === reportId || job?.job_id === reportId) {
-        stopJobTracking();
-        setJobId(null);
-        setJob(null);
-        setStatusLogs([]);
-        setIsRunning(false);
-      }
+      setActionToast({ message: uiText("Отчет удален."), severity: "error" });
       if (selectedReportId === reportId) {
         setSelectedReportId(null);
         setSelectedReportAnalysis(null);
@@ -1766,14 +1824,14 @@ function App() {
     setRetryingReportId(reportId);
     try {
       await api.retryJob(jobIdValue);
-      setActionToast({ message: "Перезапуск поставлен в очередь. Кэш включён.", severity: "success" });
+      setActionToast({ message: uiText("Перезапуск поставлен в очередь. Кэш включён."), severity: "success" });
       await loadReports(true);
+      void loadActiveReports(true);
       if (selectedReportId === reportId) {
         // Сбрасываем кэш analysis — иначе в виджете «4. Результаты» останется
         // старое превью и застывшая статистика до ручного перезахода на отчёт.
         // После null-а live-polling перезапустится и подтянет свежие данные.
         setSelectedReportAnalysis(null);
-        subscribeToEvents(jobIdValue);
       }
     } catch (e) {
       setError((e as Error).message);
@@ -1792,7 +1850,7 @@ function App() {
     const hasResults = Boolean(report.results_file) && mode === "completed";
     const hasRaw = Boolean(report.raw_file) && mode === "completed";
     const hasSource = Boolean(report.uploaded_file_id);
-    // Для partial всегда активен только формат xlsx/raw — они соберутся на лету на бэке.
+    // Промежуточные xlsx/raw используют общий кэш среза на сервере.
     const defaultFormat: "xlsx" | "raw" | "source" =
       mode === "partial" ? "xlsx" : hasResults ? "xlsx" : hasRaw ? "raw" : "source";
     setDownloadDialog({
@@ -1803,7 +1861,7 @@ function App() {
       hasRaw: mode === "partial" ? true : hasRaw,
       hasSource,
       format: defaultFormat,
-      filename: defaultName,
+      filename: mode === "partial" ? "" : defaultName,
     });
   }
 
@@ -1818,7 +1876,8 @@ function App() {
       ? `${API_ROOT}/admin/reports/${reportId}`
       : `${API_ROOT}/reports/${reportId}`;
     const segment = partial ? "download/partial" : "download";
-    const url = `${base}/${segment}/${format}?filename=${encodeURIComponent(safeFilename)}`;
+    const query = partial && !filename.trim() ? "" : `?filename=${encodeURIComponent(safeFilename)}`;
+    const url = `${base}/${segment}/${format}${query}`;
     window.open(url, "_blank");
     setDownloadDialog(null);
   }
@@ -1827,12 +1886,12 @@ function App() {
   async function savePreset() {
     const name = presetName.trim();
     if (!name) {
-      setError("Введите имя пресета.");
+      setError(uiText("Введите имя пресета."));
       return;
     }
     const promptTemplate = promptEditorValue.trim();
     if (!promptTemplate) {
-      setError("Промпт не должен быть пустым.");
+      setError(uiText("Промпт не должен быть пустым."));
       return;
     }
     if (!validateSchemaBuilder(schemaFields)) return;
@@ -1861,7 +1920,7 @@ function App() {
   function downloadPreset() {
     const promptTemplate = promptEditorValue.trim();
     if (!promptTemplate) {
-      setError("Промпт не должен быть пустым.");
+      setError(uiText("Промпт не должен быть пустым."));
       return;
     }
     if (!validateSchemaBuilder(schemaFields)) return;
@@ -1902,14 +1961,13 @@ function App() {
       const raw = JSON.parse(text) as Record<string, unknown>;
       const promptTemplate = typeof raw.prompt_template === "string" ? raw.prompt_template.trim() : "";
       const expectedTemplate = raw.expected_json_template;
-      const templateHintRaw = typeof raw.template_hint === "string" ? raw.template_hint : "";
       const importedName = typeof raw.name === "string" ? raw.name.trim() : "";
 
       if (!promptTemplate) {
-        throw new Error("В файле пресета отсутствует корректный prompt_template.");
+        throw new Error(uiText("В файле пресета отсутствует корректный prompt_template."));
       }
       if (!expectedTemplate || typeof expectedTemplate !== "object" || Array.isArray(expectedTemplate)) {
-        throw new Error("В файле пресета отсутствует корректный expected_json_template.");
+        throw new Error(uiText("В файле пресета отсутствует корректный expected_json_template."));
       }
 
       const validationError = validateExpectedJsonTemplate(expectedTemplate as Record<string, unknown>);
@@ -1923,9 +1981,9 @@ function App() {
       }
       setPresetPickerValue("");
       setError("");
-      setActionToast({ message: "Пресет загружен.", severity: "success" });
+      setActionToast({ message: uiText("Пресет загружен."), severity: "success" });
     } catch (e) {
-      setError(`Не удалось загрузить пресет: ${(e as Error).message}`);
+      setError(uiText("Не удалось загрузить пресет: {0}", (e as Error).message));
     }
   }
 
@@ -1961,55 +2019,6 @@ function App() {
     }
   }
 
-  async function openAdminReport(reportId: string) {
-    setError("");
-    setSelectedReportLoading(true);
-    setSelectedReportLoadingId(reportId);
-    try {
-      const analysis = await api.adminReportAnalysis(reportId);
-      setSelectedReportId(reportId);
-      setSelectedReportAnalysis(analysis);
-      setJob(null);
-      setJobId(null);
-      setStatusLogs([]);
-      setIsRunning(false);
-      stopJobTracking();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setSelectedReportLoading(false);
-      setSelectedReportLoadingId((prev) => (prev === reportId ? null : prev));
-    }
-  }
-
-  async function handleAdminReportAction(reportId: string, action: "pause" | "resume" | "cancel" | "delete") {
-    setError("");
-    try {
-      if (action === "pause") {
-        await api.adminPauseReport(reportId);
-        setActionToast({ message: "Задача пользователя поставлена на паузу.", severity: "warning" });
-      }
-      if (action === "resume") {
-        await api.adminResumeReport(reportId);
-        setActionToast({ message: "Задача пользователя запущена.", severity: "success" });
-      }
-      if (action === "cancel") {
-        await api.adminCancelReport(reportId);
-        setActionToast({ message: "Задача пользователя отменена.", severity: "error" });
-      }
-      if (action === "delete") {
-        await api.adminDeleteReport(reportId);
-        setActionToast({ message: "Отчет пользователя удален.", severity: "error" });
-      }
-      if (typeof adminSelectedUserId === "number") {
-        await loadAdminReports(adminSelectedUserId);
-      }
-      await loadAdminOverview();
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
   async function pauseAnalysis() {
     const activeJobId = launchJobId;
     if (!activeJobId) return;
@@ -2022,7 +2031,7 @@ function App() {
 
   async function deleteAllReports() {
     if (!reports.length) return;
-    if (!window.confirm(`Удалить все отчеты (${reports.length}) без возможности восстановления?`)) return;
+    if (!window.confirm(uiText("Удалить все отчеты ({0}) без возможности восстановления?", reports.length))) return;
     setError("");
     setDeletingAllReports(true);
     try {
@@ -2032,18 +2041,10 @@ function App() {
       const deleted = outcomes.filter((x) => x.status === "fulfilled").length;
       const failed = outcomes.length - deleted;
 
-      if (jobId && activeSet.has(jobId)) {
-        stopJobTracking();
-        setJobId(null);
-        setJob(null);
-        setStatusLogs([]);
-        setIsRunning(false);
-      }
-
       if (failed === 0) {
-        setActionToast({ message: `Удалены все отчеты: ${deleted}.`, severity: "error" });
+        setActionToast({ message: uiText("Удалены все отчеты: {0}.", deleted), severity: "error" });
       } else {
-        setActionToast({ message: `Удалено: ${deleted}, не удалено: ${failed}.`, severity: "warning" });
+        setActionToast({ message: uiText("Удалено: {0}, не удалено: {1}.", deleted, failed), severity: "warning" });
       }
       if (selectedReportId && activeSet.has(selectedReportId)) {
         setSelectedReportId(null);
@@ -2068,7 +2069,7 @@ function App() {
   }
 
   async function deleteCurrentFromLaunchBlock() {
-    const reportId = job?.job_id || jobId;
+    const reportId = selectedLaunchReport?.job_id || selectedReportId;
     if (!reportId) return;
     await deleteReport(reportId);
   }
@@ -2092,72 +2093,43 @@ function App() {
 
   const selectedLaunchReport = useMemo(() => {
     if (!selectedReportId) return null;
-    return reports.find((r) => r.id === selectedReportId) || null;
-  }, [reports, selectedReportId]);
+    return reports.find((r) => r.id === selectedReportId) || (selectedReportMeta?.id === selectedReportId ? selectedReportMeta : null);
+  }, [reports, selectedReportId, selectedReportMeta]);
 
   const activeResult = useMemo(() => {
+    if (!selectedReportId) return null;
     const isAdmin = user?.role === "admin";
     const isNonTerminal = (status: string | undefined | null): boolean =>
       status === "queued" || status === "running" || status === "paused";
-    if (job?.result?.summary) {
-      const jobStatus = job.status as string | undefined;
-      if (selectedReportId === job.job_id && selectedReportAnalysis?.summary) {
-        return {
-          title: isAdmin ? "Результаты выбранного отчета" : "4. Результаты",
-          summary: selectedReportAnalysis.summary,
-          previewRows: selectedReportAnalysis.preview_rows,
-          inProgress: isNonTerminal(jobStatus),
-          status: jobStatus ?? null,
-          resultsFileLink: `${API_ROOT}/jobs/${job.job_id}/download/xlsx`,
-          rawFileLink: job.result.raw_file
-            ? `${API_ROOT}/jobs/${job.job_id}/download/raw`
-            : null,
-        };
-      }
-      return {
-        title: isAdmin ? "Результаты выбранного отчета" : "4. Результаты",
-        summary: job.result.summary,
-        previewRows: job.result.preview_rows,
-        inProgress: isNonTerminal(jobStatus),
-        status: jobStatus ?? null,
-        resultsFileLink: `${API_ROOT}/jobs/${job.job_id}/download/xlsx`,
-        rawFileLink: job.result.raw_file
-          ? `${API_ROOT}/jobs/${job.job_id}/download/raw`
-          : null,
-      };
-    }
-    if (selectedReportAnalysis?.summary) {
-      const reportStatus = selectedReportAnalysis.status as string | undefined;
-      const inProgress = isNonTerminal(reportStatus);
-      // Пока отчёт в работе — подменяем summary живыми данными из /api/reports.
-      // Preview-строки остаются замороженными (первые 10), чтобы не грузить БД
-      // повторным чтением preview при активных 100+ пользователях.
-      // Используем live summary_json из /api/reports только если бэкенд его прислал
-      // с точными счётчиками success/failed. Синтезировать их из processed_rows НЕЛЬЗЯ:
-      // processed считает и done, и error одинаково — иначе все провалившиеся по
-      // context_exceeded строки показываются как успешные.
-      const liveSummary: JobSummary | null =
-        inProgress ? (selectedLaunchReport?.summary_json ?? null) : null;
-      return {
-        title: isAdmin ? "Результаты выбранного отчета" : "4. Результаты",
-        summary: liveSummary ?? selectedReportAnalysis.summary,
-        previewRows: selectedReportAnalysis.preview_rows,
-        inProgress,
-        status: reportStatus ?? null,
-        resultsFileLink: selectedReportId
-          ? (isAdmin
-              ? api.adminReportDownloadUrl(selectedReportId, "xlsx")
-              : `${API_ROOT}/reports/${selectedReportId}/download/xlsx`)
-          : null,
-        rawFileLink: selectedReportId
-          ? (isAdmin
-              ? api.adminReportDownloadUrl(selectedReportId, "raw")
-              : `${API_ROOT}/reports/${selectedReportId}/download/raw`)
-          : null,
-      };
-    }
-    return null;
-  }, [job, selectedReportAnalysis, selectedReportId, selectedLaunchReport, user?.role]);
+    // Единственный live-источник в v2.1.0 — polling /api/reports/active.
+    // Активный отчёт держит summary_json свежим (worker персистит в БД раз
+    // в ~1 сек). Для уже завершённых отчётов, выпавших из active-списка,
+    // fallback — selectedReportAnalysis (загружается при openReport).
+    const liveStatus = selectedLaunchReport?.status as string | undefined;
+    const liveSummary: JobSummary | null = selectedLaunchReport?.summary_json ?? null;
+    const analysisSummary = selectedReportAnalysis?.summary ?? null;
+    const summary = liveSummary ?? analysisSummary;
+    if (!summary) return null;
+    const status = liveStatus || (selectedReportAnalysis?.status as string | undefined);
+    const inProgress = isNonTerminal(status);
+    return {
+      title: isAdmin ? uiText("Результаты выбранного отчета") : uiText("4. Результаты"),
+      summary,
+      previewRows: selectedReportAnalysis?.preview_rows ?? [],
+      inProgress,
+      status: status ?? null,
+      resultsFileLink: selectedReportId
+        ? (isAdmin
+            ? api.adminReportDownloadUrl(selectedReportId, "xlsx")
+            : `${API_ROOT}/reports/${selectedReportId}/download/xlsx`)
+        : null,
+      rawFileLink: selectedReportId
+        ? (isAdmin
+            ? api.adminReportDownloadUrl(selectedReportId, "raw")
+            : `${API_ROOT}/reports/${selectedReportId}/download/raw`)
+        : null,
+    };
+  }, [selectedReportId, selectedReportAnalysis, selectedLaunchReport, user?.role]);
 
   const previewColumnKeys = useMemo(() => {
     const rows = activeResult?.previewRows ?? [];
@@ -2179,8 +2151,8 @@ function App() {
     const done = Math.max(0, summary.success_rows || 0);
     const failed = Math.max(0, summary.failed_rows || 0);
     return [
-      { name: "Успешно", value: done, fill: "#1f9d69" },
-      { name: "С ошибками", value: failed, fill: "#d14334" },
+      { name: uiText("Успешно"), value: done, fill: "#1f9d69" },
+      { name: uiText("С ошибками"), value: failed, fill: "#d14334" },
     ];
   }, [activeResult]);
 
@@ -2190,13 +2162,15 @@ function App() {
   }, [reports, showAllReports]);
 
 
-  // Live-превью: пока отчёт в работе (running/paused/queued), тянем analysis каждые 5 секунд —
-  // но только пока в UI ещё нет 10 строк превью. После того как таблица превью заполнена,
-  // поллинг останавливается: данные уже есть, повторные запросы в БД не нужны. Финальные
-  // данные всё равно подтянутся через hydrateCompletedReportAnalysis в SSE-обработчике done.
+  // Live-превью: пока отчёт в работе (running/paused/queued), тянем analysis
+  // каждые 5 секунд — но только пока в UI ещё нет 10 строк превью. После
+  // заполнения таблицы превью поллинг останавливается: данные уже есть,
+  // повторные запросы в БД не нужны. Финальные данные подтянутся при
+  // переходе в терминальный статус (этот же useEffect отработает ещё раз,
+  // т.к. selectedLaunchReport?.status — в зависимостях).
   useEffect(() => {
     if (!selectedReportId) return;
-    const liveStatus = (job?.status as string | undefined) || selectedLaunchReport?.status;
+    const liveStatus = selectedLaunchReport?.status;
     if (liveStatus !== "running" && liveStatus !== "paused" && liveStatus !== "queued") return;
     const currentPreviewCount = selectedReportAnalysis?.preview_rows?.length ?? 0;
     if (currentPreviewCount >= 10) return;
@@ -2219,78 +2193,90 @@ function App() {
       cancelled = true;
       window.clearInterval(handle);
     };
-  }, [selectedReportId, job?.status, selectedLaunchReport?.status, user?.role, selectedReportAnalysis?.preview_rows?.length]);
+  }, [selectedReportId, selectedLaunchReport?.status, user?.role, selectedReportAnalysis?.preview_rows?.length]);
 
   const launchJobId = useMemo(() => {
-    if (jobId) return jobId;
-    if (job && job.job_id !== "pending") return job.job_id;
     if (selectedLaunchReport && ["running", "queued", "paused"].includes(selectedLaunchReport.status)) {
       return selectedLaunchReport.job_id;
     }
     return null;
-  }, [jobId, job, selectedLaunchReport]);
+  }, [selectedLaunchReport]);
 
   const launchStatus = useMemo(() => {
-    if (job?.status) return job.status;
     if (selectedLaunchReport && ["running", "queued", "paused"].includes(selectedLaunchReport.status)) {
       return selectedLaunchReport.status;
     }
     return null;
-  }, [job, selectedLaunchReport]);
+  }, [selectedLaunchReport]);
 
   // Статус выбранного отчёта вне зависимости от терминальности: нужен для
   // кнопок Перезапустить/Скачать в блоке «Запуск», которые должны отображаться
   // и на failed/canceled/completed (launchStatus такие статусы намеренно не отдаёт).
   const selectedLaunchStatus = useMemo<string | null>(() => {
-    if (job?.status) return job.status as string;
     if (selectedLaunchReport?.status) return selectedLaunchReport.status;
     return null;
-  }, [job, selectedLaunchReport]);
+  }, [selectedLaunchReport]);
 
   if (!user) {
     return (
-      <Box className="page">
-      <Box className="hero" />
-      <Box className="container">
-        <Stack direction="row" justifyContent="space-between" alignItems="center">
-          <Box className="brandBox">
-            <Box className="brandLogoFrame">
-              <img
-                src={logoSrc}
-                alt="Логотип"
-                className="brandLogo"
-                onError={handleLogoError}
-              />
-            </Box>
-            <Box className="brandText">
-              <Typography variant="h4" className="title">Личный кабинет</Typography>
-            </Box>
+      <Box className="page workspace-login">
+      <Box component="header" className="workspace-topbar">
+        <Box className="workspace-topbar-inner">
+          <Box className="workspace-brand">
+            <img src={logoSrc} alt="" width={32} height={32} className="workspace-brand-image" onError={handleLogoError} />
+            <Typography component="span" className="workspace-wordmark">Analyzer</Typography>
           </Box>
-          <Button variant="outlined" onClick={toggle} startIcon={mode === "dark" ? <LightModeIcon /> : <DarkModeIcon />}>
-            {mode === "dark" ? "Светлая тема" : "Темная тема"}
-          </Button>
-        </Stack>
-          <Typography className="subtitle">Войдите или зарегистрируйтесь, чтобы запускать фоновые задачи и хранить отчеты.</Typography>
-          <Card className="card" sx={{ maxWidth: 560 }}>
+          <Tooltip title={mode === "dark" ? uiText("Светлая тема") : uiText("Тёмная тема")}>
+            <IconButton className="workspace-icon-button" onClick={toggle} aria-label={mode === "dark" ? uiText("Светлая тема") : uiText("Тёмная тема")}>
+              {mode === "dark" ? <LightModeIcon /> : <DarkModeIcon />}
+            </IconButton>
+          </Tooltip>
+        </Box>
+      </Box>
+      <Box component="main" className="workspace-login-content">
+          <Card className="card login-card" sx={{ width: "100%", maxWidth: 480 }}>
             <CardContent>
-              <Typography variant="h6">{authMode === "login" ? "Вход" : "Регистрация"}</Typography>
-              <Stack spacing={2} sx={{ mt: 2 }}>
-                <TextField label="Логин" value={authUsername} onChange={(e) => setAuthUsername(e.target.value)} />
-                <TextField
-                  label="Пароль"
-                  type="password"
-                  value={authPassword}
-                  onChange={(e) => setAuthPassword(e.target.value)}
-                  helperText={authMode === "register" ? "Минимум 8 символов, хотя бы 1 буква и 1 цифра" : undefined}
-                />
-                <Stack direction="row" spacing={1}>
-                  <Button variant="contained" onClick={doAuth} disabled={authLoading || !authUsername || !authPassword}>
-                    {authMode === "login" ? "Войти" : "Создать аккаунт"}
-                  </Button>
-                  <Button variant="outlined" onClick={() => setAuthMode(authMode === "login" ? "register" : "login")}>
-                    {authMode === "login" ? "Нет аккаунта?" : "Уже есть аккаунт?"}
-                  </Button>
-                </Stack>
+              <Stack spacing={2}>
+                <Typography variant="h5" component="h1">
+                  {authMode === "register" ? uiText("Регистрация") : uiText("Вход")}
+                </Typography>
+                {authConfig?.local_auth_enabled && (
+                  <Stack component="form" spacing={2} onSubmit={(event) => { event.preventDefault(); void doAuth(); }}>
+                    <TextField
+                      label={uiText("Логин")}
+                      autoComplete="username"
+                      required
+                      value={authUsername}
+                      onChange={(event) => setAuthUsername(event.target.value)}
+                    />
+                    <TextField
+                      label={uiText("Пароль")}
+                      type="password"
+                      autoComplete={authMode === "register" ? "new-password" : "current-password"}
+                      required
+                      value={authPassword}
+                      onChange={(event) => setAuthPassword(event.target.value)}
+                      helperText={authMode === "register" ? uiText("От 8 символов, включая букву и цифру") : undefined}
+                    />
+                    <Button type="submit" variant="contained" disabled={authLoading}>
+                      {authMode === "register" ? uiText("Создать аккаунт") : uiText("Войти")}
+                    </Button>
+                    {authConfig.local_registration_enabled && (
+                      <Button onClick={() => setAuthMode(authMode === "login" ? "register" : "login")}>
+                        {authMode === "login" ? uiText("Создать аккаунт") : uiText("Уже есть аккаунт")}
+                      </Button>
+                    )}
+                  </Stack>
+                )}
+                {authConfig?.sso_enabled && (
+                  <Stack spacing={1} alignItems="center">
+                    <Button fullWidth variant={authConfig.local_auth_enabled ? "outlined" : "contained"} href={api.ssoLoginUrl()}>{uiText("Войти через SSO")}</Button>
+                    <Link href={api.ssoLoginUrl(true)} underline="hover" variant="body2">{uiText("Войти через другой аккаунт SSO")}</Link>
+                  </Stack>
+                )}
+                {authConfig && !authConfig.sso_enabled && !authConfig.local_auth_enabled && (
+                  <Alert severity="info">{uiText("Вход отключён. Обратитесь к администратору.")}</Alert>
+                )}
               </Stack>
             </CardContent>
           </Card>
@@ -2309,28 +2295,23 @@ function App() {
     );
   }
 
-  return (
-    <Box className="page">
-      <Box className="hero" />
-      <Box className="container">
-        <Stack direction="row" justifyContent="space-between" alignItems="center">
-          <Box className="brandBox">
-            <Box className="brandLogoFrame">
-              <img
-                src={logoSrc}
-                alt="Логотип"
-                className="brandLogo"
-                onError={handleLogoError}
-              />
-            </Box>
-            <Box className="brandText">
-              <Typography variant="h4" className="title">Анализатор отзывов</Typography>
-            </Box>
-          </Box>
-          <Tooltip title="Меню">
+  if (!accessState) return <Box sx={{ p: 4 }}><Typography>{uiText("Проверка доступа…")}</Typography></Box>;
+
+  const themeLabel = mode === "dark" ? uiText("Светлая тема") : uiText("Тёмная тема");
+  const accountButton = (
+    <Stack direction="row" spacing={1} className="workspace-account-tools">
+      <Tooltip title={themeLabel}>
+        <IconButton className="workspace-icon-button" onClick={toggle} aria-label={themeLabel}>
+          {mode === "dark" ? <LightModeIcon /> : <DarkModeIcon />}
+        </IconButton>
+      </Tooltip>
+      <Tooltip title={uiText("Меню пользователя")}>
             <IconButton
               onClick={(e) => setUserMenuAnchor(e.currentTarget)}
-              aria-label="Меню"
+              className="workspace-icon-button"
+              aria-label={uiText("Меню пользователя")}
+              aria-haspopup="menu"
+              aria-expanded={Boolean(userMenuAnchor)}
               size="large"
               sx={{
                 border: 1,
@@ -2342,8 +2323,10 @@ function App() {
             >
               <MenuIcon />
             </IconButton>
-          </Tooltip>
-          <Menu
+      </Tooltip>
+    </Stack>
+  );
+  const accountMenu = (<Menu
             anchorEl={userMenuAnchor}
             open={Boolean(userMenuAnchor)}
             onClose={() => setUserMenuAnchor(null)}
@@ -2352,524 +2335,213 @@ function App() {
             PaperProps={{ sx: { minWidth: 260 } }}
           >
             <Box sx={{ px: 2, py: 1.25 }}>
-              <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>{user.username}</Typography>
-              <Typography variant="caption" color="text.secondary">
-                Роль: {user.role === "admin" ? "администратор" : "пользователь"}
+              <Typography variant="subtitle2" sx={{ fontWeight: 600 }}><UserIdentity user={user} /></Typography>
+              <Typography variant="caption" color="text.secondary">{uiText("Роль:") + " "}{user.role === "admin" ? uiText("Администратор") : accessState.is_manager ? uiText("Руководитель") : uiText("Пользователь")}
               </Typography>
             </Box>
             <Divider />
             <Box sx={{ px: 2, py: 1 }}>
-              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.5 }}>
-                Использовано токенов (всего)
-              </Typography>
-              <Typography variant="body2">
-                prompt {usage?.prompt_tokens ?? 0} · completion {usage?.completion_tokens ?? 0} · total {usage?.total_tokens ?? 0}
-              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>{uiText("Использовано токенов")}</Typography>
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: "auto 1fr",
+                  columnGap: 1.25,
+                  rowGap: 0.25,
+                  "& .label": { color: "text.secondary", fontSize: "0.85rem" },
+                  "& .value": { fontVariantNumeric: "tabular-nums", fontSize: "0.9rem" },
+                  "& .total": { fontWeight: 600 },
+                }}
+              >
+                <Tooltip title={formatTokenExact(usage?.prompt_tokens)} placement="left" arrow>
+                  <Typography component="span" className="label">{uiText("Запрос:")}</Typography>
+                </Tooltip>
+                <Tooltip title={formatTokenExact(usage?.prompt_tokens)} placement="right" arrow>
+                  <Typography component="span" className="value">{formatTokenCount(usage?.prompt_tokens)}</Typography>
+                </Tooltip>
+                <Tooltip title={formatTokenExact(usage?.completion_tokens)} placement="left" arrow>
+                  <Typography component="span" className="label">{uiText("Ответ:")}</Typography>
+                </Tooltip>
+                <Tooltip title={formatTokenExact(usage?.completion_tokens)} placement="right" arrow>
+                  <Typography component="span" className="value">{formatTokenCount(usage?.completion_tokens)}</Typography>
+                </Tooltip>
+                <Tooltip title={formatTokenExact(usage?.total_tokens)} placement="left" arrow>
+                  <Typography component="span" className="label total">{uiText("Всего:")}</Typography>
+                </Tooltip>
+                <Tooltip title={formatTokenExact(usage?.total_tokens)} placement="right" arrow>
+                  <Typography component="span" className="value total">{formatTokenCount(usage?.total_tokens)}</Typography>
+                </Tooltip>
+              </Box>
             </Box>
             <Divider />
-            <MenuItem onClick={() => { setUserMenuAnchor(null); toggle(); }}>
-              <ListItemIcon>
-                {mode === "dark" ? <LightModeIcon fontSize="small" /> : <DarkModeIcon fontSize="small" />}
-              </ListItemIcon>
-              <ListItemText>{mode === "dark" ? "Светлая тема" : "Тёмная тема"}</ListItemText>
+            {canManage && <MenuItem onClick={() => { setUserMenuAnchor(null); navigate("#/admin"); }}>
+              <ListItemIcon><SettingsIcon fontSize="small" /></ListItemIcon>
+              <ListItemText>{user.role === "admin" ? uiText("Администрирование") : uiText("Управление группами")}</ListItemText>
+            </MenuItem>}
+            <MenuItem onClick={() => { setUserMenuAnchor(null); setRulesOpen(true); }}>
+              <ListItemIcon><InfoOutlinedIcon fontSize="small" /></ListItemIcon>
+              <ListItemText>{uiText("Правила работы")}</ListItemText>
             </MenuItem>
             <MenuItem onClick={() => { setUserMenuAnchor(null); openReleaseNotes(); }}>
               <ListItemIcon><NewReleasesIcon fontSize="small" /></ListItemIcon>
-              <ListItemText>Заметки о релизе</ListItemText>
+              <ListItemText>{uiText("Заметки о релизе")}</ListItemText>
             </MenuItem>
             <Divider />
             <MenuItem onClick={() => { setUserMenuAnchor(null); doLogout(); }}>
               <ListItemIcon><LogoutIcon fontSize="small" color="error" /></ListItemIcon>
-              <ListItemText primaryTypographyProps={{ color: "error" }}>Выйти</ListItemText>
+              <ListItemText primaryTypographyProps={{ color: "error" }}>{uiText("Выйти")}</ListItemText>
             </MenuItem>
             <Divider />
             <Box sx={{ px: 2, py: 0.75 }}>
               <Typography variant="caption" color="text.secondary">
-                Анализатор отзывов · версия {APP_VERSION}
+                {uiText("Analyzer · версия {0}", APP_VERSION)}
               </Typography>
             </Box>
-          </Menu>
-        </Stack>
-
-        {user.role !== "admin" && (
-        <Card className="card">
-          <CardContent>
-            <Stack direction="row" justifyContent="space-between" alignItems="center">
-              <Typography variant="h6">Мои отчеты</Typography>
-              <Stack direction="row" spacing={0.5} alignItems="center">
-                <Tooltip title="Обновить">
-                  <IconButton size="small" onClick={refreshReportsClick} aria-label="Обновить">
-                    <RefreshIcon fontSize="small" />
-                  </IconButton>
-                </Tooltip>
-                {(reports.length > 3 || reports.length > 0) && (
-                  <Tooltip title="Управление списком">
-                    <IconButton
-                      size="small"
-                      onClick={(ev) => setReportsMenuAnchor(ev.currentTarget)}
-                      aria-label="Управление списком"
-                    >
-                      <MoreHorizIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                )}
-                <Menu
-                  anchorEl={reportsMenuAnchor}
-                  open={Boolean(reportsMenuAnchor)}
-                  onClose={() => setReportsMenuAnchor(null)}
-                  MenuListProps={{ dense: true }}
-                >
-                  {reports.length > 3 && (
-                    <MenuItem onClick={() => { setReportsMenuAnchor(null); setShowAllReports((v) => !v); }}>
-                      {showAllReports ? "Свернуть список" : `Показать ещё (${reports.length - 3})`}
-                    </MenuItem>
-                  )}
-                  <MenuItem
-                    onClick={() => { setReportsMenuAnchor(null); deleteAllReports(); }}
-                    disabled={!reports.length || deletingAllReports}
-                  >
-                    <ListItemIcon><DeleteOutlineIcon fontSize="small" color="error" /></ListItemIcon>
-                    <ListItemText primaryTypographyProps={{ color: "error" }}>Удалить все</ListItemText>
-                  </MenuItem>
-                </Menu>
-              </Stack>
-            </Stack>
-            <TableContainer sx={{ mt: 1, overflowX: "hidden" }}>
-            <Table size="small" sx={{ width: "100%", tableLayout: "fixed" }}>
-              <TableHead>
-                <TableRow>
-                  <TableCell sx={{ width: "23%" }}>Отчёт</TableCell>
-                  <TableCell sx={{ width: "16%" }}>Создан</TableCell>
-                  <TableCell sx={{ width: "10%" }}>Статус</TableCell>
-                  <TableCell sx={{ width: "28%" }}>Прогресс</TableCell>
-                  <TableCell sx={{ width: "4%" }} align="center">Инфо</TableCell>
-                  <TableCell sx={{ width: "19%" }} align="right">Действия</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {visibleReports.map((r) => {
-                  const progress = computeReportProgress(r);
-                  const { isGrouped, processed: progressProcessed, total: progressTotal, unit: progressUnit } = progress;
-                  const progressPercent = Math.round(progress.percent * 10) / 10;
-                  const etaLabel = formatEta(r.eta_seconds);
-                  const step = visibleCurrentStep(r.current_step);
-                  const reportTitle = r.source_filename?.trim() || "—";
-                  const hasAnyDownload = Boolean(r.results_file) || Boolean(r.raw_file) || Boolean(r.uploaded_file_id);
-                  const canPartialDownload = r.status === "running" || r.status === "paused";
-                  const isTerminal = r.status === "completed" || r.status === "failed" || r.status === "canceled";
-                  return (
-                    <TableRow key={r.id}>
-                      <TableCell sx={{ wordBreak: "break-word" }}>
-                        <Typography variant="body2" fontWeight={500}>{reportTitle}</Typography>
-                      </TableCell>
-                      <TableCell sx={{ whiteSpace: "nowrap" }}>
-                        <Typography variant="caption" color="text.secondary">{fmtDate(r.created_at)}</Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Chip
-                          size="small"
-                          label={statusLabel(r.status)}
-                          color={statusColor(r.status)}
-                          variant={r.status === "running" ? "filled" : "outlined"}
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <LinearProgress
-                          variant="determinate"
-                          value={Math.max(0, Math.min(100, progressPercent))}
-                          color={progressBarColor(r.status)}
-                        />
-                        <Typography variant="caption" color="text.secondary">
-                          {progressProcessed}/{progressTotal} {progressUnit} ({progressPercent.toFixed(1)}%)
-                          {etaLabel ? ` · ${etaLabel}` : ""}
-                        </Typography>
-                        {step && (
-                          <Typography variant="caption" color="text.secondary" display="block">
-                            {step}
-                          </Typography>
-                        )}
-                        {r.status === "queued" && typeof r.queue_position === "number" && (
-                          <Typography variant="caption" color="text.secondary" display="block">
-                            {formatQueueHint(r.queue_position)}
-                          </Typography>
-                        )}
-                      </TableCell>
-                      <TableCell align="center">
-                        <Tooltip
-                          arrow
-                          title={
-                            <Box sx={{ fontSize: 12, lineHeight: 1.5 }}>
-                              <div>Модель: <b>{r.provider}/{r.model}</b></div>
-                              <div>Параллелизм: <b>{r.parallelism ?? "-"}</b></div>
-                              <div>Лимит строк: <b>{r.max_reviews ?? "-"}</b></div>
-                              <div>Температура: <b>{r.temperature ?? "-"}</b></div>
-                              <div>Токены prompt: <b>{r.prompt_tokens ?? 0}</b></div>
-                              <div>Токены completion: <b>{r.completion_tokens ?? 0}</b></div>
-                              <div>Токены total: <b>{r.total_tokens ?? 0}</b></div>
-                              {r.group_by_column && (<div>Группировка: <b>{r.group_by_column}</b></div>)}
-                            </Box>
-                          }
-                        >
-                          <InfoOutlinedIcon fontSize="small" color="action" sx={{ cursor: "help" }} />
-                        </Tooltip>
-                      </TableCell>
-                      <TableCell align="right">
-                        <Stack direction="row" spacing={0.25} justifyContent="flex-end" alignItems="center">
-                          <Tooltip title="Открыть">
-                            <span>
-                              <IconButton
-                                size="small"
-                                color="info"
-                                onClick={() => openReport(r.id)}
-                                disabled={selectedReportLoadingId === r.id}
-                                aria-label="Открыть"
-                              >
-                                <OpenInNewIcon fontSize="small" />
-                              </IconButton>
-                            </span>
-                          </Tooltip>
-                          {r.status === "running" && (
-                            <Tooltip title="Пауза">
-                              <IconButton size="small" color="warning" onClick={() => handleReportAction(r.job_id, "pause")} aria-label="Пауза">
-                                <PauseIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                          )}
-                          {r.status === "paused" && (
-                            <Tooltip title="Продолжить">
-                              <IconButton size="small" color="success" onClick={() => handleReportAction(r.job_id, "resume")} aria-label="Продолжить">
-                                <PlayArrowIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                          )}
-                          {(r.status === "failed" || r.status === "canceled") && (
-                            <Tooltip title="Перезапустить (кэш включится принудительно)">
-                              <span>
-                                <IconButton
-                                  size="small"
-                                  color="secondary"
-                                  onClick={() => retryReport(r.id, r.job_id)}
-                                  disabled={retryingReportId === r.id}
-                                  aria-label="Перезапустить"
-                                >
-                                  <RestartAltIcon fontSize="small" />
-                                </IconButton>
-                              </span>
-                            </Tooltip>
-                          )}
-                          {(r.status === "running" || r.status === "queued" || r.status === "paused") && (
-                            <Tooltip title="Отменить">
-                              <IconButton size="small" color="error" onClick={() => handleReportAction(r.job_id, "cancel")} aria-label="Отменить">
-                                <StopIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                          )}
-                          {canPartialDownload && (
-                            <Tooltip title="Скачать промежуточный (соберётся на лету)">
-                              <IconButton size="small" color="inherit" onClick={() => openDownloadDialog(r, "partial")} aria-label="Скачать промежуточный">
-                                <DownloadIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                          )}
-                          {hasAnyDownload && isTerminal && (
-                            <Tooltip title="Скачать…">
-                              <IconButton size="small" color="success" onClick={() => openDownloadDialog(r, "completed")} aria-label="Скачать">
-                                <DownloadIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                          )}
-                          {isTerminal && (
-                            <Tooltip title="Удалить">
-                              <IconButton size="small" color="error" onClick={() => deleteReport(r.id)} aria-label="Удалить">
-                                <DeleteOutlineIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                          )}
-                        </Stack>
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-                {!visibleReports.length && (
-                  <TableRow>
-                    <TableCell colSpan={6}>Пока нет отчетов</TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-            </TableContainer>
-          </CardContent>
-        </Card>
-        )}
-
-        {user.role === "admin" && (
-          <Card className="card">
-            <CardContent>
-              <Stack direction="row" justifyContent="space-between" alignItems="center">
-                <Typography variant="h6">Админка</Typography>
-                <Stack direction="row" spacing={1}>
-                  <Button variant="outlined" onClick={loadAdminOverview} disabled={adminLoading}>
-                    Обновить админ-данные
-                  </Button>
-                  <Button
-                    variant={adminAutoRefresh ? "contained" : "outlined"}
-                    color={adminAutoRefresh ? "success" : "inherit"}
-                    onClick={() => setAdminAutoRefresh((v) => !v)}
-                  >
-                    {adminAutoRefresh ? "Автообновление: ВКЛ" : "Автообновление: ВЫКЛ"}
-                  </Button>
-                </Stack>
-              </Stack>
-
-              <Stack direction="row" spacing={1} sx={{ mt: 1.25 }} flexWrap="wrap" useFlexGap>
-                <Chip label={`Очередь Redis: ${adminStats?.queue_depth ?? 0}`} />
-                <Chip label={`queued: ${adminStats?.queued ?? 0}`} />
-                <Chip label={`running: ${adminStats?.running ?? 0}`} color="success" />
-                <Chip label={`paused: ${adminStats?.paused ?? 0}`} color="warning" />
-                <Chip label={`failed: ${adminStats?.failed ?? 0}`} color="error" />
-              </Stack>
-
-              <Stack direction={{ xs: "column", md: "row" }} spacing={2} sx={{ mt: 2 }} alignItems={{ md: "flex-end" }}>
-                <FormControl sx={{ minWidth: 320 }}>
-                  <InputLabel id="admin-user-select-label">Пользователь</InputLabel>
-                  <Select
-                    labelId="admin-user-select-label"
-                    value={adminSelectedUserId}
-                    label="Пользователь"
-                    onChange={(e) => {
-                      const next = e.target.value;
-                      setAdminSelectedUserId(next === "" ? "" : Number(next));
-                    }}
-                  >
-                    {adminUsers.map((u) => (
-                      <MenuItem key={u.id} value={u.id}>
-                        {u.username} ({u.role}) - отчетов: {u.reports_count}
-                      </MenuItem>
-                    ))}
-                  </Select>
-                </FormControl>
-                <Button
-                  variant="outlined"
-                  onClick={() => {
-                    if (typeof adminSelectedUserId === "number") loadAdminReports(adminSelectedUserId);
-                  }}
-                  disabled={typeof adminSelectedUserId !== "number" || adminLoading}
-                >
-                  Обновить отчеты пользователя
-                </Button>
-              </Stack>
-
-              <Typography variant="subtitle1" sx={{ mt: 2 }}>Отчеты выбранного пользователя</Typography>
-              <TableContainer sx={{ mt: 1, overflowX: "hidden" }}>
-                <Table size="small" sx={{ width: "100%", tableLayout: "fixed" }}>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Создан</TableCell>
-                      <TableCell>Статус</TableCell>
-                      <TableCell>Модель</TableCell>
-                      <TableCell>Прогресс</TableCell>
-                      <TableCell>Токены</TableCell>
-                      <TableCell>Действия</TableCell>
-                      <TableCell>Файлы</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {adminReports.map((r) => (
-                      <TableRow key={`admin-${r.id}`}>
-                        <TableCell>{fmtDate(r.created_at)}</TableCell>
-                        <TableCell>{r.status}</TableCell>
-                        <TableCell sx={{ wordBreak: "break-word" }}>{r.provider}/{r.model}</TableCell>
-                        <TableCell>
-                          <Typography variant="caption">
-                            {r.processed_rows}/{r.total_rows} ({(r.progress_percent || 0).toFixed(1)}%)
-                          </Typography>
-                          <Typography variant="caption" color="text.secondary" display="block">
-                            {r.current_step || "-"}
-                          </Typography>
-                        </TableCell>
-                        <TableCell>{r.total_tokens ?? 0}</TableCell>
-                        <TableCell>
-                          <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
-                            <Button
-                              size="small"
-                              variant={selectedReportId === r.id ? "contained" : "outlined"}
-                              onClick={() => openAdminReport(r.id)}
-                              disabled={selectedReportLoadingId === r.id}
-                            >
-                              Открыть
-                            </Button>
-                            {r.status === "running" && (
-                              <Button size="small" color="warning" onClick={() => handleAdminReportAction(r.id, "pause")}>
-                                Пауза
-                              </Button>
-                            )}
-                            {r.status === "paused" && (
-                              <Button size="small" color="success" onClick={() => handleAdminReportAction(r.id, "resume")}>
-                                Старт
-                              </Button>
-                            )}
-                            {(r.status === "running" || r.status === "queued" || r.status === "paused") && (
-                              <Button size="small" color="error" onClick={() => handleAdminReportAction(r.id, "cancel")}>
-                                Отмена
-                              </Button>
-                            )}
-                            {!["running", "queued", "paused"].includes(r.status) && (
-                              <Button size="small" variant="outlined" color="error" onClick={() => handleAdminReportAction(r.id, "delete")}>
-                                Удалить
-                              </Button>
-                            )}
-                          </Stack>
-                        </TableCell>
-                        <TableCell>
-                          <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
-                            {r.results_file && (
-                              <Button size="small" sx={{ minWidth: 0, px: 1 }} href={api.adminReportDownloadUrl(r.id, "xlsx")} target="_blank">
-                                XLSX
-                              </Button>
-                            )}
-                            {r.raw_file && (
-                              <Button size="small" sx={{ minWidth: 0, px: 1 }} href={api.adminReportDownloadUrl(r.id, "raw")} target="_blank">
-                                JSON
-                              </Button>
-                            )}
-                            {r.uploaded_file_id && (
-                              <Button size="small" sx={{ minWidth: 0, px: 1 }} href={api.adminReportDownloadUrl(r.id, "source")} target="_blank">
-                                RAW
-                              </Button>
-                            )}
-                          </Stack>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                    {!adminReports.length && (
-                      <TableRow>
-                        <TableCell colSpan={7}>Нет отчетов по выбранному пользователю</TableCell>
-                      </TableRow>
-                    )}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-
-              <Typography variant="subtitle1" sx={{ mt: 2 }}>Последние ошибки задач</Typography>
-              <TableContainer sx={{ mt: 1, overflowX: "hidden" }}>
-                <Table size="small" sx={{ width: "100%", tableLayout: "fixed" }}>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Время</TableCell>
-                      <TableCell>Пользователь</TableCell>
-                      <TableCell>Report</TableCell>
-                      <TableCell>Ошибка</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {(adminStats?.recent_failures || []).map((f) => (
-                      <TableRow key={`fail-${f.report_id}-${f.updated_at || ""}`}>
-                        <TableCell>{fmtDate(f.updated_at)}</TableCell>
-                        <TableCell>{f.username}</TableCell>
-                        <TableCell>{f.report_id}</TableCell>
-                        <TableCell sx={{ wordBreak: "break-word" }}>{f.error_text || "-"}</TableCell>
-                      </TableRow>
-                    ))}
-                    {!adminStats?.recent_failures?.length && (
-                      <TableRow>
-                        <TableCell colSpan={4}>Ошибок нет</TableCell>
-                      </TableRow>
-                    )}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-
-              <Typography variant="subtitle1" sx={{ mt: 2 }}>Логи</Typography>
-              <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mt: 1 }} alignItems={{ md: "center" }}>
-                <FormControl size="small" sx={{ minWidth: 140 }}>
-                  <InputLabel id="admin-log-service">Сервис</InputLabel>
-                  <Select
-                    labelId="admin-log-service"
-                    value={adminLogService}
-                    label="Сервис"
-                    onChange={(e) => setAdminLogService(String(e.target.value) as "all" | "backend" | "worker")}
-                  >
-                    <MenuItem value="all">Все</MenuItem>
-                    <MenuItem value="backend">backend</MenuItem>
-                    <MenuItem value="worker">worker</MenuItem>
-                  </Select>
-                </FormControl>
-                <FormControl size="small" sx={{ minWidth: 140 }}>
-                  <InputLabel id="admin-log-level">Уровень</InputLabel>
-                  <Select
-                    labelId="admin-log-level"
-                    value={adminLogLevel}
-                    label="Уровень"
-                    onChange={(e) => setAdminLogLevel(String(e.target.value) as "" | "INFO" | "WARNING" | "ERROR")}
-                  >
-                    <MenuItem value="">Все</MenuItem>
-                    <MenuItem value="INFO">INFO</MenuItem>
-                    <MenuItem value="WARNING">WARNING</MenuItem>
-                    <MenuItem value="ERROR">ERROR</MenuItem>
-                  </Select>
-                </FormControl>
-                <TextField
-                  size="small"
-                  label="Поиск"
-                  value={adminLogQuery}
-                  onChange={(e) => setAdminLogQuery(e.target.value)}
-                  sx={{ minWidth: 220 }}
+          </Menu>);
+  const releaseDialog = (<Dialog
+          open={releaseNotesOpen}
+          onClose={closeReleaseNotes}
+          maxWidth="md"
+          fullWidth
+          PaperProps={{ sx: { height: "min(80vh, 720px)" } }}
+        >
+          <DialogTitle sx={{ pb: 0.5 }}>{uiText("Заметки о релизе")}<IconButton
+              onClick={closeReleaseNotes}
+              sx={{ position: "absolute", right: 8, top: 8 }}
+              aria-label={uiText("Закрыть")}
+            >
+              <CloseIcon fontSize="small" />
+            </IconButton>
+          </DialogTitle>
+          {releases.length > 0 && (
+            <Tabs
+              value={activeReleaseTab}
+              onChange={(_, next) => {
+                setActiveReleaseTab(next);
+                // Сбрасываем прокрутку при смене вкладки, чтобы новый релиз
+                // показывался с начала, а не «оборванным» с того места где
+                // юзер остановился в предыдущей вкладке.
+                releaseNotesContentRef.current?.scrollTo({ top: 0 });
+              }}
+              variant="scrollable"
+              scrollButtons="auto"
+              sx={{ px: 2, borderBottom: 1, borderColor: "divider" }}
+            >
+              {releases.map((entry, idx) => (
+                <Tab
+                  key={entry.version}
+                  label={
+                    idx === 0 ? (
+                      <Stack direction="row" spacing={0.75} alignItems="center">
+                        <span>{entry.version}</span>
+                        <Chip label={uiText("актуальная")} size="small" color="primary" sx={{ height: 20, fontSize: "0.7rem" }} />
+                      </Stack>
+                    ) : (
+                      entry.version
+                    )
+                  }
+                  sx={{ textTransform: "none", fontWeight: 600 }}
                 />
-                <TextField
-                  size="small"
-                  type="number"
-                  label="Строк"
-                  value={adminLogLinesLimit}
-                  onChange={(e) => {
-                    const next = Number(e.target.value || 200);
-                    setAdminLogLinesLimit(Math.max(10, Math.min(1000, Number.isFinite(next) ? next : 200)));
-                  }}
-                  sx={{ width: 110 }}
-                />
-                <Button variant="outlined" onClick={loadAdminLogs} disabled={adminLogsLoading}>
-                  Обновить логи
-                </Button>
-                <Button
-                  variant={adminLogsAutoRefresh ? "contained" : "outlined"}
-                  color={adminLogsAutoRefresh ? "success" : "inherit"}
-                  onClick={() => setAdminLogsAutoRefresh((v) => !v)}
-                >
-                  {adminLogsAutoRefresh ? "Автообновление логов: ВКЛ" : "Автообновление логов: ВЫКЛ"}
-                </Button>
+              ))}
+            </Tabs>
+          )}
+          <DialogContent ref={releaseNotesContentRef} dividers>
+            {releasesLoading && (
+              <Stack alignItems="center" sx={{ py: 4 }}>
+                <LinearProgress aria-label={uiText("Загрузка заметок о релизе")} sx={{ width: "100%" }} />
+                <Typography variant="caption" color="text.secondary" sx={{ mt: 1 }}>{uiText("Загружаем заметки…")}</Typography>
               </Stack>
-              <Box className="logs" sx={{ mt: 1, maxHeight: 280 }}>
-                {sortedAdminLogs.map((line, idx) => (
-                  <Typography
-                    key={`${line.ts || ""}-${idx}`}
-                    variant="body2"
-                    className="logline"
-                    sx={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}
-                  >
-                    [{line.ts ? fmtDate(line.ts) : "-"}] [{line.service || "-"}] [{line.level || "-"}]
-                    {line.request_id ? ` [${line.request_id}]` : ""}
-                    {line.user_id && line.user_id !== "-" ? ` [user_id=${line.user_id}]` : ""}
-                    {line.username && line.username !== "-" ? ` [username=${line.username}]` : ""} {line.message}
-                  </Typography>
-                ))}
-                {!adminLogs.length && (
-                  <Typography variant="body2" color="text.secondary">
-                    Логов пока нет
-                  </Typography>
-                )}
+            )}
+            {!releasesLoading && releasesError && (
+              <Typography variant="body2" color="error">
+                {releasesError}
+              </Typography>
+            )}
+            {!releasesLoading && !releasesError && releases.length === 0 && (
+              <Typography variant="body2" color="text.secondary">{uiText("Заметки о релизе пока не опубликованы.")}</Typography>
+            )}
+            {!releasesLoading && !releasesError && releases.length > 0 && releases[activeReleaseTab] && (
+              <Box>
+                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1 }}>
+                  {releases[activeReleaseTab].title}
+                </Typography>
+                <UserMarkdown content={releases[activeReleaseTab].content_md} />
               </Box>
-            </CardContent>
-          </Card>
-        )}
+            )}
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeReleaseNotes} variant="contained">{uiText("Закрыть")}</Button>
+          </DialogActions>
+        </Dialog>);
+  const rulesDialog = <UserRulesDialog open={rulesOpen} onClose={() => setRulesOpen(false)} />;
+  if (!accessState.has_access) return <>
+    <AccessPage state={accessState} logout={doLogout} logoSrc={logoSrc} accountActions={<>{accountButton}{accountMenu}</>} />
+    {releaseDialog}{rulesDialog}
+  </>;
 
-        {user.role !== "admin" && (
-        <Card className="card">
-          <CardContent>
-            <Typography variant="h6">1. Данные и модель</Typography>
+  if (canManage && locationHash.startsWith("#/admin")) return <AdminScreen
+    isAdmin={user.role === "admin"} userId={user.id} hash={locationHash} menuButton={accountButton} accountMenu={<>{accountMenu}{releaseDialog}{rulesDialog}</>} logoSrc={logoSrc}
+    onChanged={() => { void loadUsage(); void accessCall<AccessState>("/access/status").then(applyAccessState); }} />;
+
+  const sections = [
+    { id: "data-import", label: uiText("Данные и модель"), icon: <CloudUploadIcon fontSize="small" /> },
+    { id: "prompt-template", label: uiText("Шаблон"), icon: <DescriptionIcon fontSize="small" /> },
+    { id: "analysis-run", label: uiText("Запуск"), icon: <PlayArrowIcon fontSize="small" /> },
+    ...(activeResult?.summary ? [{ id: "analysis-result", label: uiText("Результат"), icon: <DownloadIcon fontSize="small" /> }] : []),
+    { id: "my-reports", label: uiText("Мои отчёты"), icon: <FolderOpenIcon fontSize="small" /> },
+  ];
+  const selectedSection = sections.find((section) => `#${section.id}` === locationHash)?.id ?? sections[0].id;
+
+  return (
+    <Box className="page workspace-page">
+      <a className="workspace-skip" href="#workspace-main">{uiText("К анализу")}</a>
+      <Box component="header" className="workspace-topbar">
+        <Box className="workspace-topbar-inner">
+          <Box className="workspace-brand">
+            <img src={logoSrc} alt="" width={32} height={32} className="workspace-brand-image" onError={handleLogoError} />
+            <Typography component="span" className="workspace-wordmark">Analyzer</Typography>
+          </Box>
+          {accountButton}
+          {accountMenu}
+        </Box>
+      </Box>
+        <Box component="main" className="workspace-main workspace-layout" id="workspace-main" tabIndex={-1}>
+          <Box className="workspace-intro">
+            <Typography component="h1">{uiText("Анализ отзывов")}</Typography>
+          </Box>
+        <Box component="nav" className="workspace-nav" aria-label={uiText("Разделы анализа")}>
+          {sections.map((section) => (
+            <a key={section.id} href={`#${section.id}`} aria-current={selectedSection === section.id ? "location" : undefined}>
+              {section.icon}
+              <span>{section.label}</span>
+            </a>
+          ))}
+          {canManage && (
+            <a className="workspace-nav-management" href="#/admin">
+              <SettingsIcon fontSize="small" />
+              <span>{user.role === "admin" ? uiText("Управление") : uiText("Мои группы")}</span>
+            </a>
+          )}
+        </Box>
+          {user.role === "admin" && modelCatalogReady && providers.length === 0 && <ModelSetupNotice isAdmin />}
+        {accessState.has_access && (
+        <Card className="card workspace-section" id="data-import">
+        <CardContent>
+          <Dialog open={requestGroupOpen} onClose={() => setRequestGroupOpen(false)} fullWidth maxWidth="sm">
+            <DialogTitle>{uiText("Запросить доступ в другую группу")}</DialogTitle>
+            <AccessRequestForm state={accessState} secondary onChanged={applyAccessState} onClose={() => setRequestGroupOpen(false)} />
+          </Dialog>
+            <Box className="workspace-file-heading">
+              <Typography variant="h6" component="h2">{uiText("Данные и модель")}</Typography>
+              {!fileInfo && (
+                <Button variant="text" onClick={openExamples} startIcon={<FolderOpenIcon />} sx={{ minHeight: 44 }}>{uiText("Примеры файлов")}</Button>
+              )}
+            </Box>
             <input
               ref={fileInputRef}
               hidden
               type="file"
-              accept=".xlsx"
+              accept=".xlsx,.csv"
               onChange={(e) => {
                 handleFileUpload(e.target.files?.[0]);
                 // Сбрасываем value, чтобы onChange сработал даже если пользователь
@@ -2877,7 +2549,6 @@ function App() {
                 if (fileInputRef.current) fileInputRef.current.value = "";
               }}
             />
-            <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} alignItems="stretch">
             <Box
               className={`dropzone ${dragActive ? "active" : ""}`}
               onDragOver={(e) => {
@@ -2886,67 +2557,34 @@ function App() {
               }}
               onDragLeave={() => setDragActive(false)}
               onDrop={onDrop}
-              sx={{ textAlign: "center", py: 3, flex: 1 }}
             >
-              {fileInfo ? (
-                // Файл загружен — показываем имя и формат
-                <Stack direction="row" spacing={1.5} alignItems="center" justifyContent="center">
-                  <DescriptionIcon color="success" sx={{ fontSize: 48 }} />
-                  <Stack direction="column" alignItems="flex-start">
-                    <Typography variant="body1" fontWeight={500}>
-                      {fileInfo.filename}
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Формат XLSX · Нажмите «
-                      <Link
-                        component="button"
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                        sx={{ cursor: "pointer" }}
-                      >
-                        загрузить другой файл
-                      </Link>
-                      », если нужно заменить
-                    </Typography>
-                  </Stack>
-                </Stack>
-              ) : (
-                <Stack direction="column" spacing={1} alignItems="center">
-                  <CloudUploadIcon color="action" sx={{ fontSize: 40 }} />
-                  <Typography>
-                    Переместите файл сюда или{" "}
-                    <Link
-                      component="button"
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      sx={{ cursor: "pointer", fontWeight: 500 }}
-                    >
-                      загрузите вручную
-                    </Link>
+              <Box className="workspace-upload-content">
+                <Box className="workspace-upload-icon">
+                  {fileInfo ? <DescriptionIcon fontSize="small" /> : <CloudUploadIcon fontSize="small" />}
+                </Box>
+                <Box className="workspace-upload-copy">
+                  <Typography className="workspace-upload-label">
+                    {fileInfo?.filename ?? uiText("Перетащите файл сюда")}
                   </Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Поддерживаемый формат: XLSX
-                  </Typography>
-                </Stack>
-              )}
+                  {!fileInfo && (
+                    <Typography variant="body2" color="text.secondary">{uiText("XLSX или CSV · UTF-8 или Windows-1251")}</Typography>
+                  )}
+                </Box>
+                <Button
+                  variant={fileInfo ? "outlined" : "contained"}
+                  onClick={() => fileInputRef.current?.click()}
+                  className="workspace-choose-file"
+                >
+                  {fileInfo ? uiText("Заменить файл") : uiText("Выбрать файл")}
+                </Button>
+              </Box>
             </Box>
-            {!fileInfo && (
-              <Button
-                variant="outlined"
-                onClick={openExamples}
-                startIcon={<FolderOpenIcon />}
-                sx={{ minWidth: { md: 180 }, whiteSpace: "nowrap" }}
-              >
-                Примеры файлов
-              </Button>
-            )}
-            </Stack>
 
             {(fileInspectStatus === "queued" || fileInspectStatus === "parsing") && (
               <Box sx={{ mt: 2 }}>
-                <LinearProgress />
+                <LinearProgress aria-label={uiText("Подготовка файла")} />
                 <Typography variant="caption" color="text.secondary" sx={{ mt: 0.75, display: "block" }}>
-                  {fileInspectMessage || "Подготовка файла..."}
+                  {fileInspectMessage || uiText("Подготовка файла...")}
                 </Typography>
                 {typeof fileInfo?.queue_position === "number" && (
                   <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
@@ -2956,15 +2594,29 @@ function App() {
               </Box>
             )}
 
+          <Box ref={quotaSectionRef} tabIndex={-1} className="workspace-quota">
+            <GroupUsage groups={accessState.groups} selected={accessGroupId}
+              onChange={id => { setAccessGroupId(id); setQuotaFailure(null); setLaunchError(""); }}
+              actions={<Box sx={{ minWidth: 0, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 1 }}>
+                <Button variant="text" color="inherit" size="small" sx={{ textTransform: "none", textDecoration: "underline" }}
+                  onClick={() => setRulesOpen(true)}>{uiText("Правила работы")}</Button>
+                <RequestAccessButton pending={accessState.requests.some(r => r.status === "pending")} onClick={() => setRequestGroupOpen(true)} />
+              </Box>}
+              notice={<AccessRequestNotice state={accessState} onChanged={applyAccessState} />} />
+          </Box>
+
+            {fileInfo && <TextField fullWidth label={uiText("Название отчёта")} value={reportName} inputProps={{ maxLength: 200 }}
+              onChange={e => setReportName(e.target.value)} sx={{ mt: 2 }} helperText={uiText("Название в списках отчётов")} />}
+
             {fileInfo && (
               <Stack direction={{ xs: "column", md: "row" }} spacing={2} sx={{ mt: 2 }} alignItems="stretch">
                 <FormControl fullWidth>
                   <InputLabel id="sheet-label" shrink>
-                    <FieldLabelContent label="Лист" hint="Страница Excel-файла, строки которой пойдут в анализ." />
+                    <FieldLabelContent label={uiText("Лист")} hint={uiText("Страница Excel-файла, строки которой пойдут в анализ.")} />
                   </InputLabel>
                   <Select
                     labelId="sheet-label"
-                    label="Лист ⓘ"
+                    label={uiText("Лист ⓘ")}
                     notched
                     displayEmpty
                     value={sheetName}
@@ -2979,13 +2631,13 @@ function App() {
                 <FormControl fullWidth>
                   <InputLabel id="analysis-cols-label" shrink>
                     <FieldLabelContent
-                      label="Колонки для анализа"
-                      hint="Эти поля отправятся модели на анализ. В итоговый отчёт они не копируются — если нужны в xlsx, добавьте их в «Колонки из исходника в итоговый отчёт»."
+                      label={uiText("Колонки для анализа")}
+                      hint={uiText("Эти поля отправятся модели на анализ. В итоговый отчёт они не копируются — если нужны в xlsx, добавьте их в «Колонки из исходника в итоговый отчёт».")}
                     />
                   </InputLabel>
                   <Select
                     labelId="analysis-cols-label"
-                    label="Колонки для анализа ⓘ"
+                    label={uiText("Колонки для анализа ⓘ")}
                     notched
                     displayEmpty
                     multiple
@@ -3003,18 +2655,18 @@ function App() {
                   </Select>
                 </FormControl>
 
-                <FormControl fullWidth disabled={Boolean(groupByColumn)}>
+                <FormControl fullWidth>
                   <InputLabel id="non-analysis-cols-label" shrink>
                     <FieldLabelContent
-                      label="Колонки в итоговый отчёт"
+                      label={uiText("Колонки в итоговый отчёт")}
                       hint={groupByColumn
-                        ? "При группировке недоступно — значения внутри группы могут различаться."
-                        : "Копируются в итоговый xlsx без обработки моделью. Можно выбирать те же колонки, что и для анализа — в итоге появятся один раз."}
+                        ? uiText("В групповом отчёте сохраняются на листе «Исходные данные» с номером группы, без отправки в модель.")
+                        : uiText("Копируются в итоговый xlsx без обработки моделью. Можно выбирать те же колонки, что и для анализа — в итоге появятся один раз.")}
                     />
                   </InputLabel>
                   <Select
                     labelId="non-analysis-cols-label"
-                    label="Колонки в итоговый отчёт ⓘ"
+                    label={uiText("Колонки в итоговый отчёт ⓘ")}
                     notched
                     displayEmpty
                     multiple
@@ -3035,19 +2687,19 @@ function App() {
                 <FormControl fullWidth>
                   <InputLabel id="group-by-label" shrink>
                     <FieldLabelContent
-                      label="Группировка (опц.)"
-                      hint="Строки с одинаковым значением этой колонки обрабатываются как одна группа — один запрос в модель на всю группу, результат применяется ко всем строкам."
+                      label={uiText("Группировка (опц.)")}
+                      hint={uiText("Строки с одинаковым значением этой колонки обрабатываются как одна группа — один запрос в модель на всю группу, результат применяется ко всем строкам.")}
                     />
                   </InputLabel>
                   <Select
                     labelId="group-by-label"
-                    label="Группировка (опц.) ⓘ"
+                    label={uiText("Группировка (опц.) ⓘ")}
                     notched
                     displayEmpty
                     value={groupByColumn}
                     onChange={(e) => setGroupByColumn(String(e.target.value))}
                   >
-                    <MenuItem value="">Без группировки</MenuItem>
+                    <MenuItem value="">{uiText("Без группировки")}</MenuItem>
                     {selectedSheetColumns.map((col) => (
                       <MenuItem key={col} value={col}>{col}</MenuItem>
                     ))}
@@ -3059,25 +2711,21 @@ function App() {
             {fileInfo && (
               <Accordion sx={{ mt: 3, "&::before": { display: "none" } }} disableGutters elevation={0} variant="outlined">
                 <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                  <Typography variant="subtitle1" fontWeight={500}>
-                    Продвинутые настройки LLM
-                  </Typography>
-                  <Typography variant="caption" color="text.secondary" sx={{ ml: 2, alignSelf: "center" }}>
-                    Провайдер, модель, токен, лимиты, кэш
-                  </Typography>
+                  <Typography variant="subtitle1" fontWeight={500}>{uiText("Продвинутые настройки LLM")}</Typography>
+                  <Typography variant="caption" color="text.secondary" sx={{ ml: 2, alignSelf: "center" }}>{uiText("Провайдер, модель, токен, лимиты, кэш")}</Typography>
                 </AccordionSummary>
                 <AccordionDetails>
                   <Stack direction={{ xs: "column", md: "row" }} spacing={2} alignItems="stretch">
                     <FormControl fullWidth>
                       <InputLabel id="provider-label" shrink>
                         <FieldLabelContent
-                          label="Провайдер"
-                          hint="Выбери, куда будет уходить запрос: OpenAI-совместимая платформа или локальный LLM (Ollama)."
+                          label={uiText("Провайдер")}
+                          hint={uiText("Выбери, куда будет уходить запрос: OpenAI-совместимая платформа или локальный LLM (Ollama).")}
                         />
                       </InputLabel>
                       <Select
                         labelId="provider-label"
-                        label="Провайдер ⓘ"
+                        label={uiText("Провайдер ⓘ")}
                         notched
                         displayEmpty
                         value={provider}
@@ -3092,22 +2740,30 @@ function App() {
                     <FormControl fullWidth>
                       <InputLabel id="model-label" shrink>
                         <FieldLabelContent
-                          label="Модель"
-                          hint="Конкретная модель выбранного провайдера. Мощнее — точнее, но дороже по токенам и медленнее."
+                          label={uiText("Модель")}
+                          hint={uiText("Конкретная модель выбранного провайдера. Мощнее — точнее, но дороже по токенам и медленнее.")}
                         />
                       </InputLabel>
                       <Select
+                        disabled={!models.length}
                         labelId="model-label"
-                        label="Модель ⓘ"
+                        label={uiText("Модель ⓘ")}
                         notched
                         displayEmpty
                         value={model}
+                        renderValue={value => models.find(m => m.model === value)?.display_name || value}
                         onChange={(e) => setModel(String(e.target.value))}
                       >
+                        {!models.length && <MenuItem disabled value="">{EMPTY_MODELS_TEXT}</MenuItem>}
                         {models.map((item) => (
-                          <MenuItem key={item} value={item}>{item}</MenuItem>
+                          <MenuItem key={item.model} value={item.model} sx={{ whiteSpace: "normal" }}>
+                            <Box><Typography>{item.display_name}</Typography>
+                              {item.description && <Typography variant="caption" color="text.secondary">{item.description}</Typography>}
+                            </Box>
+                          </MenuItem>
                         ))}
                       </Select>
+                      {modelCatalogReady && providers.length === 0 && user.role !== "admin" && <ModelSetupNotice isAdmin={false} />}
                     </FormControl>
 
                     {provider === "openai" && (
@@ -3118,8 +2774,8 @@ function App() {
                             type="password"
                             label={(
                               <FieldLabelContent
-                                label="API-токен"
-                                hint={apiKey.trim() ? "Используется твой токен из этого поля." : "Поле пустое — сервер возьмёт ключ из переменной OPENAI_API_KEY."}
+                                label={uiText("API-токен")}
+                                hint={apiKey.trim() ? uiText("Используется твой токен из этого поля.") : uiText("Поле пустое — сервер возьмёт ключ из переменной OPENAI_API_KEY.")}
                               />
                             )}
                             InputLabelProps={{ shrink: true }}
@@ -3133,12 +2789,12 @@ function App() {
                             disabled={tokenVerifyLoading}
                             sx={{ whiteSpace: "nowrap", flexShrink: 0 }}
                           >
-                            {tokenVerifyLoading ? "Проверяем…" : "Проверить"}
+                            {tokenVerifyLoading ? uiText("Проверяем…") : uiText("Проверить")}
                           </Button>
                         </Stack>
                         {tokenVerifyResult?.ok && (
                           <Typography variant="caption" color="success.main" sx={{ wordBreak: "break-word" }}>
-                            {`OK (моделей: ${tokenVerifyResult.models.length})`}
+                            {uiText("OK (моделей: {0})", tokenVerifyResult.models.length)}
                           </Typography>
                         )}
                       </Stack>
@@ -3151,8 +2807,8 @@ function App() {
                       type="number"
                       label={(
                         <FieldLabelContent
-                          label="Лимит отзывов"
-                          hint="Максимум строк, которые уйдут в модель в этом запуске. Остальные строки файла будут проигнорированы."
+                          label={uiText("Лимит отзывов")}
+                          hint={uiText("Максимум строк, которые уйдут в модель в этом запуске. Остальные строки файла будут проигнорированы.")}
                         />
                       )}
                       InputLabelProps={{ shrink: true }}
@@ -3175,8 +2831,8 @@ function App() {
                       type="number"
                       label={(
                         <FieldLabelContent
-                          label="Параллелизм"
-                          hint={`Сколько строк обрабатываются одновременно. Выше — быстрее, но выше нагрузка и риск rate-limit провайдера (макс ${parallelismMax}).`}
+                          label={uiText("Параллелизм")}
+                          hint={uiText("Сколько строк обрабатываются одновременно. Выше — быстрее, но выше нагрузка и риск rate-limit провайдера (макс {0}).", parallelismMax)}
                         />
                       )}
                       InputLabelProps={{ shrink: true }}
@@ -3190,8 +2846,8 @@ function App() {
                       type="number"
                       label={(
                         <FieldLabelContent
-                          label="Температура"
-                          hint="0 — детерминированный ответ, 2 — максимально творческий. Для классификации и структурированного анализа оставляй 0."
+                          label={uiText("Температура")}
+                          hint={uiText("0 — строгие задачи, 0.7 — творческие. Для классификации и структурированного анализа используйте 0.")}
                         />
                       )}
                       InputLabelProps={{ shrink: true }}
@@ -3202,26 +2858,24 @@ function App() {
                   </Stack>
 
                   {selectedSheetRows > 0 && (
-                    <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>
-                      В выбранном листе строк с данными: {selectedSheetRows}
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>{uiText("В выбранном листе строк с данными:") + " "}{selectedSheetRows}
                       {groupByColumn && selectedGroupCount !== null && selectedGroupCount !== undefined && (
                         <>
-                          {" "}· будет обработано <b>{selectedGroupCount.toLocaleString("ru-RU")}</b> {pluralizeGroups(selectedGroupCount)} (колонка «{groupByColumn}»)
+                          {" "}{uiText("· будет обработано") + " "}<b>{selectedGroupCount.toLocaleString(uiLocale())}</b> {pluralizeGroups(selectedGroupCount)}{" " + uiText("(колонка «")}{groupByColumn}»)
                         </>
                       )}
                       {groupByColumn && selectedGroupCount === null && (
                         <>
-                          {" "}· групп слишком много (более 100 000 уникальных значений) — проверь колонку группировки, возможно она не годится для агрегации
-                        </>
+                          {" "}{uiText("· групп слишком много (более 100 000 уникальных значений) — проверь колонку группировки, возможно она не годится для агрегации")}</>
                       )}
                     </Typography>
                   )}
 
                   <Stack direction="row" spacing={1} sx={{ mt: 2 }} flexWrap="wrap" useFlexGap>
                     {provider === "openai" && (
-                      <Tooltip arrow title="Токен запомнится в этой вкладке браузера до её закрытия — после F5 вводить заново не нужно. При закрытии вкладки или окна токен пропадает.">
+                      <Tooltip arrow title={uiText("Токен запомнится в этой вкладке браузера до её закрытия — после F5 вводить заново не нужно. При закрытии вкладки или окна токен пропадает.")}>
                         <Chip
-                          label="Помнить токен на эту вкладку"
+                          label={uiText("Помнить токен на эту вкладку")}
                           color={rememberToken ? "info" : "default"}
                           variant={rememberToken ? "filled" : "outlined"}
                           onClick={() => setRememberToken((v) => !v)}
@@ -3229,18 +2883,18 @@ function App() {
                       </Tooltip>
                     )}
                     {provider === "openai" && (
-                      <Tooltip arrow title="Токен шифруется и сохраняется на сервере, чтобы после рестарта сервиса (backend/worker) задачу можно было продолжить без повторного ввода. Нужно только если ставишь свою задачу на длительную обработку.">
+                      <Tooltip arrow title={uiText("Токен шифруется и сохраняется на сервере, чтобы после рестарта сервиса (backend/worker) задачу можно было продолжить без повторного ввода. Нужно только если ставишь свою задачу на длительную обработку.")}>
                         <Chip
-                          label="Помнить токен после перезапуска сервиса"
+                          label={uiText("Помнить токен после перезапуска сервиса")}
                           color={saveApiKeyForResume ? "info" : "default"}
                           variant={saveApiKeyForResume ? "filled" : "outlined"}
                           onClick={() => setSaveApiKeyForResume((v) => !v)}
                         />
                       </Tooltip>
                     )}
-                    <Tooltip arrow title="Если модель уже отвечала на такой же отзыв с тем же промптом — берём сохранённый ответ и не тратим токены. Выключай только для тестов с одинаковыми входными данными и ожиданием разных ответов.">
+                    <Tooltip arrow title={uiText("Если модель уже отвечала на такой же отзыв с тем же промптом — берём сохранённый ответ и не тратим токены. Выключай только для тестов с одинаковыми входными данными и ожиданием разных ответов.")}>
                       <Chip
-                        label="Использовать кэш ответов модели"
+                        label={uiText("Использовать кэш ответов модели")}
                         color={useCache ? "success" : "default"}
                         variant={useCache ? "filled" : "outlined"}
                         onClick={() => setUseCache((v) => !v)}
@@ -3254,14 +2908,16 @@ function App() {
         </Card>
         )}
 
-        {user.role !== "admin" && (
-        <Card className="card">
+        {accessState.has_access && (
+        <Card className="card workspace-section" id="prompt-template">
           <CardContent>
-            <Stack direction="row" alignItems="center" spacing={1}>
-              <Typography variant="h6">2. Шаблон</Typography>
+            <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap" useFlexGap>
+              <Typography variant="h6" component="h2">{uiText("Шаблон")}</Typography>
+                <Button onClick={() => setPromptFullScreen(true)}>{uiText("Полноэкранный редактор")}</Button>
+                <Button disabled={previewLoading || !fileInfo} onClick={() => void showPromptPreview()}>{uiText("Показать, что уйдёт в модель")}</Button>
               <Chip
                 icon={<InfoOutlinedIcon />}
-                label={templateInfoExpanded ? "Скрыть инструкцию" : "Как это работает"}
+                label={templateInfoExpanded ? uiText("Скрыть инструкцию") : uiText("Как это работает")}
                 size="small"
                 color="primary"
                 variant={templateInfoExpanded ? "filled" : "outlined"}
@@ -3271,108 +2927,73 @@ function App() {
             </Stack>
             <Collapse in={templateInfoExpanded}>
               <Alert severity="info" sx={{ mt: 1 }}>
-                <Typography variant="body2" sx={{ fontWeight: 700, mb: 0.5 }}>Что такое «Шаблон» — в двух словах</Typography>
-                <Typography variant="body2">
-                  Это то, что вы объясняете модели: <strong>какую задачу решить</strong> (промпт) и <strong>в каком виде вернуть ответ</strong> (поля ответа).
-                  Один раз настроили шаблон — дальше сервис прогонит его по всему загруженному файлу, строка за строкой.
-                </Typography>
+                <Typography variant="body2" sx={{ fontWeight: 700, mb: 0.5 }}>{uiText("Что такое «Шаблон» — в двух словах")}</Typography>
+                <Typography variant="body2">{uiText("Это то, что вы объясняете модели:") + " "}<strong>{uiText("какую задачу решить")}</strong>{" " + uiText("(промпт) и") + " "}<strong>{uiText("в каком виде вернуть ответ")}</strong>{" " + uiText("(поля ответа). Один раз настроили шаблон — дальше сервис прогонит его по всему загруженному файлу, строка за строкой.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 700 }}>Быстрый старт на тестовом файле</Typography>
-                <Typography variant="body2">
-                  Если хочется сразу посмотреть как всё работает — в блоке «1. Данные и модель» справа от зоны загрузки есть кнопка <strong>«Примеры файлов»</strong>.
-                  В ней лежат готовые xlsx с отзывами клиентов (1 000 и 100 000 строк). Выбираете файл, подбираете под него один из двух готовых пресетов и жмёте запуск.
-                  Ниже — какие колонки куда поставить под каждый сценарий.
-                </Typography>
+                <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 700 }}>{uiText("Быстрый старт на тестовом файле")}</Typography>
+                <Typography variant="body2">{uiText("Если хочется сразу посмотреть как всё работает — в блоке «Данные и модель» справа от зоны загрузки есть кнопка") + " "}<strong>{uiText("«Примеры файлов»")}</strong>{uiText(". В ней лежат готовые xlsx с отзывами клиентов (1 000 и 100 000 строк). Выбираете файл, подбираете под него один из двух готовых пресетов и жмёте запуск. Ниже — какие колонки куда поставить под каждый сценарий.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 1, fontWeight: 600 }}>Сценарий А. Построчная проверка каждого отзыва</Typography>
-                <Typography variant="body2">
-                  Пресет: <strong>«Пример: Проверка отзывов на мошенничество сотрудников»</strong>. Модель оценит каждый отзыв по отдельности.
-                </Typography>
-                <Typography variant="body2">— <em>Лист</em>: первый (единственный в файле).</Typography>
-                <Typography variant="body2">— <em>Колонки для анализа</em>: <code>отзыв</code> — единственное поле, которое реально уходит в модель.</Typography>
-                <Typography variant="body2">— <em>Колонки из исходника в итоговый отчёт</em>: <code>id</code>, <code>магазин</code>, <code>смена</code>, <code>оценка</code>, <code>дата</code> — попадут в итоговый xlsx без отправки в модель, чтобы потом можно было сопоставить результат с исходной записью.</Typography>
-                <Typography variant="body2">— <em>Группировка</em>: оставить пустой.</Typography>
-                <Typography variant="body2">— В блоке «2. Шаблон» в списке «Пресет» выбрать тот же построчный пресет — промпт и поля ответа подставятся сами.</Typography>
-                <Typography variant="body2">— В блоке «3. Обработка» — «Запустить новый анализ». Каждая строка получит категорию, тип нарушения, уверенность и описание.</Typography>
+                <Typography variant="body2" sx={{ mt: 1, fontWeight: 600 }}>{uiText("Сценарий А. Построчная проверка каждого отзыва")}</Typography>
+                <Typography variant="body2">{uiText("Пресет:") + " "}<strong>{uiText("«Пример: Проверка отзывов на мошенничество сотрудников»")}</strong>{uiText(". Модель оценит каждый отзыв по отдельности.")}</Typography>
+                <Typography variant="body2">— <em>{uiText("Лист")}</em>{uiText(": первый (единственный в файле).")}</Typography>
+                <Typography variant="body2">— <em>{uiText("Колонки для анализа")}</em>: <code>{uiText("отзыв")}</code>{" " + uiText("— единственное поле, которое реально уходит в модель.")}</Typography>
+                <Typography variant="body2">— <em>{uiText("Колонки из исходника в итоговый отчёт")}</em>: <code>id</code>, <code>{uiText("магазин")}</code>, <code>{uiText("смена")}</code>, <code>{uiText("оценка")}</code>, <code>{uiText("дата")}</code>{" " + uiText("— попадут в итоговый xlsx без отправки в модель, чтобы потом можно было сопоставить результат с исходной записью.")}</Typography>
+                <Typography variant="body2">— <em>{uiText("Группировка")}</em>{uiText(": оставить пустой.")}</Typography>
+                <Typography variant="body2">{uiText("— В блоке «Шаблон» в списке «Пресет» выбрать тот же построчный пресет — промпт и поля ответа подставятся сами.")}</Typography>
+                <Typography variant="body2">{uiText("— В блоке «3. Обработка» — «Запустить новый анализ». Каждая строка получит категорию, тип нарушения, уверенность и описание.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 1, fontWeight: 600 }}>Сценарий Б. Сводка по сменам (групповой анализ)</Typography>
-                <Typography variant="body2">
-                  Пресет: <strong>«Пример: Анализ мошенничества по магазинам (группировка)»</strong>. Модель получит отзывы одной смены целиком и вернёт один агрегат на группу.
-                </Typography>
-                <Typography variant="body2">— <em>Лист</em>: первый.</Typography>
-                <Typography variant="body2">— <em>Колонки для анализа</em>: <code>отзыв</code>.</Typography>
-                <Typography variant="body2">— <em>Группировка</em>: <code>смена</code> — это главное отличие от сценария А. Модель увидит все отзывы смены разом и оценит её целиком.</Typography>
-                <Typography variant="body2">— <em>Колонки из исходника в итоговый отчёт</em>: в групповом режиме это поле блокируется — в итоговый xlsx попадает только колонка группировки и ответ модели (одна строка на группу).</Typography>
-                <Typography variant="body2">— В блоке «2. Шаблон» — пресет «Анализ мошенничества по магазинам (группировка)».</Typography>
-                <Typography variant="body2">— В результате каждая смена получит: число подтверждённых нарушений, долю в процентах, встреченные схемы, уровень риска (низкий / средний / высокий) и краткое описание.</Typography>
+                <Typography variant="body2" sx={{ mt: 1, fontWeight: 600 }}>{uiText("Сценарий Б. Сводка по сменам (групповой анализ)")}</Typography>
+                <Typography variant="body2">{uiText("Пресет:") + " "}<strong>{uiText("«Пример: Анализ мошенничества по магазинам (группировка)»")}</strong>{uiText(". Модель получит отзывы одной смены целиком и вернёт один агрегат на группу.")}</Typography>
+                <Typography variant="body2">— <em>{uiText("Лист")}</em>{uiText(": первый.")}</Typography>
+                <Typography variant="body2">— <em>{uiText("Колонки для анализа")}</em>: <code>{uiText("отзыв")}</code>.</Typography>
+                <Typography variant="body2">— <em>{uiText("Группировка")}</em>: <code>{uiText("смена")}</code>{" " + uiText("— это главное отличие от сценария А. Модель увидит все отзывы смены разом и оценит её целиком.")}</Typography>
+                <Typography variant="body2">— <em>{uiText("Колонки из исходника в итоговый отчёт")}</em>{uiText(": при группировке сохраняются на листе «Исходные данные» с номером группы. Основной лист содержит одну строку на группу.")}</Typography>
+                <Typography variant="body2">{uiText("— В блоке «Шаблон» — пресет «Анализ мошенничества по магазинам (группировка)».")}</Typography>
+                <Typography variant="body2">{uiText("— В результате каждая смена получит: число подтверждённых нарушений, долю в процентах, встреченные схемы, уровень риска (низкий / средний / высокий) и краткое описание.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 0.75, fontStyle: "italic", color: "text.secondary" }}>
-                  Совет: для обоих сценариев берите файл на 1 000 строк — прогон занимает минуты, можно быстро оценить качество. Файл на 100 000 строк — для нагрузочного теста после того, как шаблон устраивает.
-                </Typography>
+                <Typography variant="body2" sx={{ mt: 0.75, fontStyle: "italic", color: "text.secondary" }}>{uiText("Совет: для обоих сценариев берите файл на 1 000 строк — прогон занимает минуты, можно быстро оценить качество. Файл на 100 000 строк — для нагрузочного теста после того, как шаблон устраивает.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 700 }}>Как сделать под свою задачу</Typography>
-                <Typography variant="body2" sx={{ mt: 0.5, fontWeight: 600 }}>Шаг 1. Напишите промпт</Typography>
-                <Typography variant="body2">
-                  Промпт — это текст инструкции для модели. Пишите его как задачу коллеге: короткими и понятными фразами.
-                </Typography>
-                <Typography variant="body2">— Объясните, что модель должна сделать с одной записью из файла (отзывом, заявкой, сообщением).</Typography>
-                <Typography variant="body2">— Опишите критерии. Например: «позитивный» — клиент доволен, «негативный» — есть явная жалоба. Не оставляйте на угадывание.</Typography>
-                <Typography variant="body2">— Если тема сложная — дайте 1–2 коротких примера прямо в промпте.</Typography>
-                <Typography variant="body2">
-                  — В промпте <strong>не нужно</strong> писать «вот отзыв: …» или подставлять содержимое ячеек вручную.
-                  Сервис сам на каждой итерации берёт очередную строку из вашего файла и передаёт её модели вместе с вашим промптом.
-                </Typography>
+                <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 700 }}>{uiText("Как сделать под свою задачу")}</Typography>
+                <Typography variant="body2" sx={{ mt: 0.5, fontWeight: 600 }}>{uiText("Шаг 1. Напишите промпт")}</Typography>
+                <Typography variant="body2">{uiText("Промпт — это текст инструкции для модели. Пишите его как задачу коллеге: короткими и понятными фразами.")}</Typography>
+                <Typography variant="body2">{uiText("— Объясните, что модель должна сделать с одной записью из файла (отзывом, заявкой, сообщением).")}</Typography>
+                <Typography variant="body2">{uiText("— Опишите критерии. Например: «позитивный» — клиент доволен, «негативный» — есть явная жалоба. Не оставляйте на угадывание.")}</Typography>
+                <Typography variant="body2">{uiText("— Если тема сложная — дайте 1–2 коротких примера прямо в промпте.")}</Typography>
+                <Typography variant="body2">{uiText("— В промпте") + " "}<strong>{uiText("не нужно")}</strong>{" " + uiText("писать «вот отзыв: …» или подставлять содержимое ячеек вручную. Сервис сам на каждой итерации берёт очередную строку из вашего файла и передаёт её модели вместе с вашим промптом.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 0.75, fontWeight: 600 }}>Шаг 2. Настройте поля ответа</Typography>
-                <Typography variant="body2">
-                  Это «анкета», которую модель обязана заполнить по каждой строке. Называйте поля так, как вам удобно — хоть по-русски.
-                </Typography>
-                <Typography variant="body2">— Для каждого поля укажите тип: текст, число, дата, список-выбор, да/нет, массив.</Typography>
-                <Typography variant="body2">— Если ответ должен быть из фиксированного набора (например, «позитивный / нейтральный / негативный») — используйте тип «список-выбор». Тогда модель не придумает своих категорий.</Typography>
-                <Typography variant="body2">— Для чисел задайте диапазон (например, 1..5), для длинных текстов — ограничение длины, иначе модель напишет целое эссе.</Typography>
-                <Typography variant="body2">— Добавляйте любые поля под свою задачу. Сервис сам проверит ответ модели и, если формат не сошёлся, отправит строку на повторную попытку с объяснением, что исправить.</Typography>
+                <Typography variant="body2" sx={{ mt: 0.75, fontWeight: 600 }}>{uiText("Шаг 2. Настройте поля ответа")}</Typography>
+                <Typography variant="body2">{uiText("Это «анкета», которую модель обязана заполнить по каждой строке. Называйте поля так, как вам удобно — хоть по-русски.")}</Typography>
+                <Typography variant="body2">{uiText("— Для каждого поля укажите тип: текст, число, дата, список-выбор, да/нет, массив.")}</Typography>
+                <Typography variant="body2">{uiText("— Если ответ должен быть из фиксированного набора (например, «позитивный / нейтральный / негативный») — используйте тип «список-выбор». Тогда модель не придумает своих категорий.")}</Typography>
+                <Typography variant="body2">{uiText("— Для чисел задайте диапазон (например, 1..5), для длинных текстов — ограничение длины, иначе модель напишет целое эссе.")}</Typography>
+                <Typography variant="body2">{uiText("— Добавляйте любые поля под свою задачу. Сервис сам проверит ответ модели и, если формат не сошёлся, отправит строку на повторную попытку с объяснением, что исправить.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 0.75, fontWeight: 600 }}>Шаг 3. Запустите и наблюдайте</Typography>
-                <Typography variant="body2">
-                  — Провайдер и модель настраиваются в блоке «1. Данные и модель» (раскройте «Продвинутые настройки LLM»). По умолчанию уже подставлен рабочий набор —
-                  если не хотите менять, переходите дальше.
-                </Typography>
-                <Typography variant="body2">— В блоке «3. Обработка» нажмите «Запустить новый анализ».</Typography>
-                <Typography variant="body2">
-                  — В блоке «4. Результаты» прямо во время обработки появляются первые готовые строки.
-                  На них удобно сразу увидеть, даёт ли промпт нужный результат, не дожидаясь конца всего отчёта.
-                </Typography>
-                <Typography variant="body2">
-                  — Если качество не то — нажмите «Остановить», поправьте промпт или поля, затем снова «Запустить новый анализ».
-                  Цена ошибки в начале — секунды, в конце — полчаса.
-                </Typography>
-                <Typography variant="body2">— Готовый отчёт скачивается в xlsx в блоке «4. Результаты». Промежуточные выгрузки доступны и в процессе.</Typography>
+                <Typography variant="body2" sx={{ mt: 0.75, fontWeight: 600 }}>{uiText("Шаг 3. Запустите и наблюдайте")}</Typography>
+                <Typography variant="body2">{uiText("— Провайдер и модель настраиваются в блоке «Данные и модель» (раскройте «Продвинутые настройки LLM»). По умолчанию уже подставлен рабочий набор — если не хотите менять, переходите дальше.")}</Typography>
+                <Typography variant="body2">{uiText("— В блоке «3. Обработка» нажмите «Запустить новый анализ».")}</Typography>
+                <Typography variant="body2">{uiText("— В блоке «4. Результаты» прямо во время обработки появляются первые готовые строки. На них удобно сразу увидеть, даёт ли промпт нужный результат, не дожидаясь конца всего отчёта.")}</Typography>
+                <Typography variant="body2">{uiText("— Если качество не то — нажмите «Остановить», поправьте промпт или поля, затем снова «Запустить новый анализ». Цена ошибки в начале — секунды, в конце — полчаса.")}</Typography>
+                <Typography variant="body2">{uiText("— Готовый отчёт скачивается в xlsx в блоке «4. Результаты». Промежуточные выгрузки доступны и в процессе.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 700 }}>Про модели (практика)</Typography>
-                <Typography variant="body2">
-                  Для простых задач (тональность, классификация) подойдёт любая модель. Если в промпте сложные правила с «если…и…иначе…» или числовыми порогами —
-                  берите крупные instruct-модели (например, Qwen3-235B, Claude Sonnet/Opus), слабые модели на таких правилах промахиваются.
-                </Typography>
+                <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 700 }}>{uiText("Про модели (практика)")}</Typography>
+                <Typography variant="body2">{uiText("Для простых задач (тональность, классификация) подойдёт любая модель. Если в промпте сложные правила с «если…и…иначе…» или числовыми порогами — берите крупные instruct-модели (например, Qwen3-235B, Claude Sonnet/Opus), слабые модели на таких правилах промахиваются.")}</Typography>
 
-                <Typography variant="body2" sx={{ mt: 1, fontWeight: 700 }}>Пресеты и свои шаблоны</Typography>
-                <Typography variant="body2">
-                  В выпадающем списке «Пресет» сейчас два готовых примера — построчный и групповой анализ мошенничества. Их удобно взять как стартовую точку,
-                  даже если ваша задача другая: посмотрите как устроен промпт и поля ответа, замените под себя. Свою версию можно сохранить как личный пресет,
-                  чтобы возвращаться к ней в следующих отчётах. Библиотеку готовых пресетов будем расширять.
-                </Typography>
+                <Typography variant="body2" sx={{ mt: 1, fontWeight: 700 }}>{uiText("Пресеты и свои шаблоны")}</Typography>
+                <Typography variant="body2">{uiText("В выпадающем списке «Пресет» сейчас два готовых примера — построчный и групповой анализ мошенничества. Их удобно взять как стартовую точку, даже если ваша задача другая: посмотрите как устроен промпт и поля ответа, замените под себя. Свою версию можно сохранить как личный пресет, чтобы возвращаться к ней в следующих отчётах. Библиотеку готовых пресетов будем расширять.")}</Typography>
 
               </Alert>
             </Collapse>
             <Stack direction={{ xs: "column", md: "row" }} spacing={1} alignItems={{ xs: "stretch", md: "center" }} sx={{ mt: 1 }}>
               <FormControl sx={{ minWidth: 240, flex: 1 }}>
-                <InputLabel>Пресет</InputLabel>
+                <InputLabel id="workspace-preset-label">{uiText("Пресет")}</InputLabel>
                 <Select
+                  labelId="workspace-preset-label"
                   value={presetPickerValue}
-                  label="Пресет"
+                  label={uiText("Пресет")}
                   onChange={(e) => { void applyPresetSelection(String(e.target.value)); }}
                 >
                   {presets.map((preset) => (
-                    <MenuItem key={preset.id} value={`user:${preset.id}`}>{`Личный: ${preset.name}`}</MenuItem>
+                    <MenuItem key={preset.id} value={`user:${preset.id}`}>{uiText("Личный: {0}", preset.name)}</MenuItem>
                   ))}
                   {READY_PRESETS.map((preset) => (
                     <MenuItem key={preset.id} value={`ready:${preset.id}`}>{preset.label}</MenuItem>
@@ -3380,34 +3001,34 @@ function App() {
                 </Select>
               </FormControl>
               <TextField
-                label="Имя пресета"
+                label={uiText("Имя пресета")}
                 value={presetName}
                 onChange={(e) => setPresetName(e.target.value)}
                 sx={{ minWidth: 200, flex: 1 }}
               />
               <Stack direction="row" spacing={0.5} alignItems="center">
-                <Tooltip arrow title="Сохранить пресет">
-                  <IconButton color="success" onClick={savePreset} aria-label="Сохранить пресет">
+                <Tooltip arrow title={uiText("Сохранить пресет")}>
+                  <IconButton color="primary" onClick={savePreset} aria-label={uiText("Сохранить пресет")}>
                     <SaveIcon />
                   </IconButton>
                 </Tooltip>
-                <Tooltip arrow title="Загрузить пресет из файла">
-                  <IconButton color="info" onClick={() => presetUploadInputRef.current?.click()} aria-label="Загрузить пресет из файла">
+                <Tooltip arrow title={uiText("Загрузить пресет из файла")}>
+                  <IconButton color="primary" onClick={() => presetUploadInputRef.current?.click()} aria-label={uiText("Загрузить пресет из файла")}>
                     <CloudUploadIcon />
                   </IconButton>
                 </Tooltip>
-                <Tooltip arrow title="Выгрузить пресет в файл">
-                  <IconButton color="success" onClick={downloadPreset} aria-label="Выгрузить пресет в файл">
+                <Tooltip arrow title={uiText("Выгрузить пресет в файл")}>
+                  <IconButton color="primary" onClick={downloadPreset} aria-label={uiText("Выгрузить пресет в файл")}>
                     <DownloadIcon />
                   </IconButton>
                 </Tooltip>
-                <Tooltip arrow title={presetPickerValue.startsWith("user:") ? "Удалить пресет" : "Удалить можно только личный пресет"}>
+                <Tooltip arrow title={presetPickerValue.startsWith("user:") ? uiText("Удалить пресет") : uiText("Удалить можно только личный пресет")}>
                   <span>
                     <IconButton
                       color="error"
                       onClick={deleteSelectedPreset}
                       disabled={!presetPickerValue.startsWith("user:")}
-                      aria-label="Удалить пресет"
+                      aria-label={uiText("Удалить пресет")}
                     >
                       <DeleteOutlineIcon />
                     </IconButton>
@@ -3430,7 +3051,7 @@ function App() {
               minRows={6}
               maxRows={24}
               fullWidth
-              label="Промпт"
+              label={uiText("Промпт")}
               value={promptEditorValue}
               onChange={(e) => setPromptEditorValue(e.target.value)}
               sx={{
@@ -3447,10 +3068,8 @@ function App() {
             >
               <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                 <Box>
-                  <Typography variant="subtitle1">Настройка полей ответа</Typography>
-                  <Typography variant="body2" color="text.secondary">
-                    Здесь настраиваются поля, которые модель должна вернуть по итогам анализа.
-                  </Typography>
+                  <Typography variant="subtitle1" component="span">{uiText("Настройка полей ответа")}</Typography>
+                  <Typography variant="body2" color="text.secondary">{uiText("Здесь настраиваются поля, которые модель должна вернуть по итогам анализа.")}</Typography>
                 </Box>
               </AccordionSummary>
               <AccordionDetails>
@@ -3462,63 +3081,56 @@ function App() {
                       onChange={(e) => setShowAdvancedSchemaAttrs(e.target.checked)}
                     />
                   }
-                  label="Расширенные настройки полей (длина, диапазон, формат даты, мин/макс элементов)"
+                  label={uiText("Расширенные настройки полей (длина, диапазон, формат даты, мин/макс элементов)")}
                 />
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                  Названия полей можно задавать на русском или латинице — модель поймёт любой вариант.
-                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>{uiText("Названия полей можно задавать на русском или латинице — модель поймёт любой вариант.")}</Typography>
                 <Stack spacing={1.25}>
                   {schemaFields.map((field, index) => (
                     <Card key={field.id} variant="outlined">
                       <CardContent>
                         <Stack direction={{ xs: "column", md: "row" }} spacing={1.25} alignItems={{ md: "center" }}>
                           <TextField
-                            label="Название поля"
-                            placeholder="Например: тональность, категория, краткое_описание"
+                            label={uiText("Название поля")}
+                            placeholder={uiText("Например: тональность, категория, краткое_описание")}
                             value={field.name}
                             onChange={(e) => updateSchemaField(field.id, { name: e.target.value })}
                             fullWidth
                           />
                           <FormControl sx={{ minWidth: 180 }}>
-                            <InputLabel>Тип</InputLabel>
+                            <InputLabel id={`output-type-${field.id}`}>{uiText("Тип")}</InputLabel>
                             <Select
+                              labelId={`output-type-${field.id}`}
                               value={field.type}
-                              label="Тип"
+                              label={uiText("Тип")}
                               onChange={(e) => updateSchemaField(field.id, { type: e.target.value as BuilderFieldType })}
                             >
-                              <MenuItem value="text">Текст</MenuItem>
-                              <MenuItem value="number">Число</MenuItem>
-                              <MenuItem value="datetime">Дата и время</MenuItem>
-                              <MenuItem value="list">Список</MenuItem>
+                              <MenuItem value="text">{uiText("Текст")}</MenuItem>
+                              <MenuItem value="number">{uiText("Число")}</MenuItem>
+                              <MenuItem value="datetime">{uiText("Дата и время")}</MenuItem>
+                              <MenuItem value="list">{uiText("Список")}</MenuItem>
                             </Select>
                           </FormControl>
                           <Stack direction="row" spacing={1}>
-                            <Button variant="outlined" onClick={() => moveSchemaField(field.id, -1)} disabled={index === 0}>
-                              Вверх
-                            </Button>
+                            <Button variant="outlined" onClick={() => moveSchemaField(field.id, -1)} disabled={index === 0}>{uiText("Вверх")}</Button>
                             <Button
                               variant="outlined"
                               onClick={() => moveSchemaField(field.id, 1)}
                               disabled={index === schemaFields.length - 1}
-                            >
-                              Вниз
-                            </Button>
-                            <Button variant="outlined" color="error" onClick={() => removeSchemaField(field.id)}>
-                              Удалить
-                            </Button>
+                            >{uiText("Вниз")}</Button>
+                            <Button variant="outlined" color="error" onClick={() => removeSchemaField(field.id)}>{uiText("Удалить")}</Button>
                           </Stack>
                         </Stack>
 
                         {field.type === "text" && showAdvancedSchemaAttrs && (
                           <Stack direction={{ xs: "column", md: "row" }} spacing={1.25} sx={{ mt: 1.25 }}>
                             <TextField
-                              label="Мин. длина"
+                              label={uiText("Мин. длина")}
                               value={field.textMinLength}
                               onChange={(e) => updateSchemaField(field.id, { textMinLength: e.target.value })}
                               sx={{ minWidth: 160 }}
                             />
                             <TextField
-                              label="Макс. длина"
+                              label={uiText("Макс. длина")}
                               value={field.textMaxLength}
                               onChange={(e) => updateSchemaField(field.id, { textMaxLength: e.target.value })}
                               sx={{ minWidth: 160 }}
@@ -3529,13 +3141,13 @@ function App() {
                         {field.type === "number" && showAdvancedSchemaAttrs && (
                           <Stack direction={{ xs: "column", md: "row" }} spacing={1.25} sx={{ mt: 1.25 }}>
                             <TextField
-                              label="Минимум"
+                              label={uiText("Минимум")}
                               value={field.numberMin}
                               onChange={(e) => updateSchemaField(field.id, { numberMin: e.target.value })}
                               sx={{ minWidth: 180 }}
                             />
                             <TextField
-                              label="Максимум"
+                              label={uiText("Максимум")}
                               value={field.numberMax}
                               onChange={(e) => updateSchemaField(field.id, { numberMax: e.target.value })}
                               sx={{ minWidth: 180 }}
@@ -3547,22 +3159,32 @@ function App() {
                                   onChange={(e) => updateSchemaField(field.id, { numberIntegerOnly: e.target.checked })}
                                 />
                               }
-                              label="Только целое"
+                              label={uiText("Только целое")}
                             />
                           </Stack>
+                        )}
+                        {field.type === "number" && showAdvancedSchemaAttrs && (
+                          <Typography variant="caption" color={
+                            [field.numberMin, field.numberMax].some((v) => v.trim() && parseDecimal(v) === null) ? "error" : "text.secondary"
+                          } sx={{ display: "block", mt: 0.5 }}>
+                            {[field.numberMin, field.numberMax].some((v) => v.trim() && parseDecimal(v) === null)
+                              ? uiText("Минимум и максимум должны быть числами, например 0 или 2,5.")
+                              : uiText("Дробные значения, например 2,5, можно указывать через запятую. Для оценок с половинками снимите «Только целое».")}
+                          </Typography>
                         )}
 
                         {field.type === "datetime" && showAdvancedSchemaAttrs && (
                           <Stack direction={{ xs: "column", md: "row" }} spacing={1.25} sx={{ mt: 1.25 }}>
                             <FormControl sx={{ minWidth: 220 }}>
-                              <InputLabel>Формат</InputLabel>
+                              <InputLabel id={`output-format-${field.id}`}>{uiText("Формат")}</InputLabel>
                               <Select
+                                labelId={`output-format-${field.id}`}
                                 value={field.datetimeMode}
-                                label="Формат"
+                                label={uiText("Формат")}
                                 onChange={(e) => updateSchemaField(field.id, { datetimeMode: e.target.value as BuilderDateMode })}
                               >
-                                <MenuItem value="date">Только дата</MenuItem>
-                                <MenuItem value="datetime">Дата и время</MenuItem>
+                                <MenuItem value="date">{uiText("Только дата")}</MenuItem>
+                                <MenuItem value="datetime">{uiText("Дата и время")}</MenuItem>
                               </Select>
                             </FormControl>
                           </Stack>
@@ -3581,18 +3203,18 @@ function App() {
                                   onChange={(e) => updateSchemaField(field.id, { listSingle: e.target.checked })}
                                 />
                               }
-                              label="Выбрать только одно значение (иначе модель вернёт массив)"
+                              label={uiText("Выбрать только одно значение (иначе модель вернёт массив)")}
                             />
                             {!field.listSingle && showAdvancedSchemaAttrs && (
                               <Stack direction={{ xs: "column", md: "row" }} spacing={1.25}>
                                 <TextField
-                                  label="Мин. элементов"
+                                  label={uiText("Мин. элементов")}
                                   value={field.listMinItems}
                                   onChange={(e) => updateSchemaField(field.id, { listMinItems: e.target.value })}
                                   sx={{ minWidth: 180 }}
                                 />
                                 <TextField
-                                  label="Макс. элементов"
+                                  label={uiText("Макс. элементов")}
                                   value={field.listMaxItems}
                                   onChange={(e) => updateSchemaField(field.id, { listMaxItems: e.target.value })}
                                   sx={{ minWidth: 180 }}
@@ -3606,26 +3228,20 @@ function App() {
                   ))}
                 </Stack>
                 <Stack direction="row" spacing={1} sx={{ mt: 1.25, flexWrap: "wrap" }}>
-                  <Button variant="outlined" startIcon={<AddIcon />} onClick={addSchemaField}>
-                    Добавить поле
-                  </Button>
+                  <Button variant="outlined" startIcon={<AddIcon />} onClick={addSchemaField}>{uiText("Добавить поле")}</Button>
                   <Button
                     variant="outlined"
                     onClick={() => {
                       if (validateSchemaBuilder(schemaFields)) {
-                        setActionToast({ message: "Схема валидна.", severity: "success" });
+                        setActionToast({ message: uiText("Схема валидна."), severity: "success" });
                       }
                     }}
-                  >
-                    Проверить схему
-                  </Button>
+                  >{uiText("Проверить схему")}</Button>
                   <Button
                     variant="outlined"
                     startIcon={<RestartAltIcon />}
                     onClick={resetTemplateBuilder}
-                  >
-                    Сброс
-                  </Button>
+                  >{uiText("Сброс")}</Button>
                 </Stack>
                 {schemaBuilderError && (
                   <Alert severity="error" sx={{ mt: 1.25 }}>
@@ -3638,28 +3254,33 @@ function App() {
         </Card>
         )}
 
-        {user.role !== "admin" && (
-        <Card className="card">
+        {accessState.has_access && (
+        <Card className="card workspace-section" id="analysis-run">
           <CardContent>
-            <Typography variant="h6">3. Обработка</Typography>
+            <Typography variant="h6" component="h2">{uiText("Обработка")}</Typography>
+            <ReportQuota report={selectedLaunchReport} />
             {selectedLaunchReport && (
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Управление выбранным отчетом: {fmtDate(selectedLaunchReport.created_at)}
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>{uiText("Управление выбранным отчетом:") + " "}{fmtDate(selectedLaunchReport.created_at)}
               </Typography>
             )}
+            <Box ref={launchFeedbackRef} tabIndex={-1} sx={{ mt: quotaFailure || launchError || quotaBlocked ? 1.5 : 0, outlineOffset: 4 }}>
+              {quotaFailure ? <Alert severity="warning" action={quotaFailure.alternative && <Button color="inherit" onClick={() => {
+                setAccessGroupId(quotaFailure.alternative!.id); setQuotaFailure(null); setLaunchError(""); showQuota();
+              }}>{uiText("Переключить на «")}{quotaFailure.alternative.name}»</Button>} sx={{ overflowWrap: "anywhere", flexWrap: "wrap", "& .MuiAlert-action": { ml: 0, pl: 0 } }}>
+                {quotaFailure.message}
+              </Alert> : launchError ? <Alert severity="error">{launchError}</Alert>
+                : quotaBlockMessage && <Alert severity="warning" sx={{ overflowWrap: "anywhere" }}
+                  action={<Button color="inherit" onClick={showQuota}>{uiText("К квотам")}</Button>}>{quotaBlockMessage}</Alert>}
+            </Box>
             <Stack direction="row" spacing={1} sx={{ mt: 1 }} flexWrap="wrap" useFlexGap>
-              <Button variant="contained" startIcon={<PlayArrowIcon />} onClick={startAnalysis}>
-                Запустить новый анализ
-              </Button>
+              <Button variant="contained" startIcon={<PlayArrowIcon />} onClick={startAnalysis} disabled={quotaBlocked || !model}>{uiText("Запустить новый анализ")}</Button>
+              {!model && <Typography variant="body2" color="text.secondary">{modelCatalogReady && !providers.length
+                ? EMPTY_MODELS_TEXT : uiText("Загружаем список моделей…")}</Typography>}
               {(launchStatus === "running" || launchStatus === "queued") && (
-                <Button variant="outlined" color="warning" startIcon={<PauseIcon />} onClick={pauseAnalysis}>
-                  Пауза
-                </Button>
+                <Button variant="outlined" color="warning" startIcon={<PauseIcon />} onClick={pauseAnalysis}>{uiText("Пауза")}</Button>
               )}
               {launchStatus === "paused" && (
-                <Button variant="outlined" color="success" startIcon={<PlayArrowIcon />} onClick={resumeAnalysis}>
-                  Продолжить
-                </Button>
+                <Button variant="outlined" color="success" startIcon={<PlayArrowIcon />} onClick={resumeAnalysis}>{uiText("Продолжить")}</Button>
               )}
               <Button
                 variant="outlined"
@@ -3667,17 +3288,13 @@ function App() {
                 startIcon={<StopIcon />}
                 onClick={cancelAnalysis}
                 disabled={!launchJobId || !["running", "queued", "paused"].includes(launchStatus || "")}
-              >
-                Остановить
-              </Button>
+              >{uiText("Остановить")}</Button>
               {selectedLaunchReport && (selectedLaunchStatus === "running" || selectedLaunchStatus === "paused") && (
                 <Button
                   variant="outlined"
                   startIcon={<DownloadIcon />}
                   onClick={() => openDownloadDialog(selectedLaunchReport, "partial")}
-                >
-                  Скачать промежуточный…
-                </Button>
+                >{uiText("Скачать промежуточный…")}</Button>
               )}
               {selectedLaunchReport && (selectedLaunchStatus === "failed" || selectedLaunchStatus === "canceled") && (
                 <Button
@@ -3686,9 +3303,7 @@ function App() {
                   startIcon={<RestartAltIcon />}
                   onClick={() => retryReport(selectedLaunchReport.id, selectedLaunchReport.job_id)}
                   disabled={retryingReportId === selectedLaunchReport.id}
-                >
-                  Перезапустить
-                </Button>
+                >{uiText("Перезапустить")}</Button>
               )}
               {selectedLaunchReport && selectedLaunchStatus === "completed" && (Boolean(selectedLaunchReport.results_file) || Boolean(selectedLaunchReport.raw_file) || Boolean(selectedLaunchReport.uploaded_file_id)) && (
                 <Button
@@ -3696,63 +3311,147 @@ function App() {
                   color="success"
                   startIcon={<DownloadIcon />}
                   onClick={() => openDownloadDialog(selectedLaunchReport, "completed")}
-                >
-                  Скачать…
-                </Button>
+                >{uiText("Скачать…")}</Button>
               )}
-              {job && !["running", "queued", "paused"].includes(job.status) && (
+              {selectedLaunchReport && !["running", "queued", "paused"].includes(selectedLaunchReport.status) && (
                 <Button
                   variant="outlined"
                   color="error"
                   startIcon={<DeleteOutlineIcon />}
                   onClick={deleteCurrentFromLaunchBlock}
-                >
-                  Удалить
-                </Button>
+                >{uiText("Удалить")}</Button>
               )}
             </Stack>
 
             <Box sx={{ mt: 2 }}>
               {(() => {
-                // Приоритет: для групповых отчётов всегда group_processed/total из
-                // /api/reports snapshot (job.* из SSE идёт в строках — с лейблом «групп»
-                // не совпадает). Для обычных — live job, иначе snapshot. current_step
-                // с воркера «Обработка N/M» для групп скрываем — N/M в строках сбивает.
+                // Единственный источник прогресса в v2.1.0 — snapshot из
+                // /api/reports/active (поллинг ~1.5 сек). Для группового
+                // режима показываем group_processed/group_total — иначе
+                // processed/total.
                 const progress = computeReportProgress(selectedLaunchReport);
-                const processedDisplay = progress.isGrouped
-                  ? progress.processed
-                  : (job ? job.processed : progress.processed);
-                const totalDisplay = progress.isGrouped
-                  ? progress.total
-                  : (job ? job.total : progress.total);
+                const processedDisplay = progress.processed;
+                const totalDisplay = progress.total;
                 const percentDisplay = totalDisplay > 0
                   ? (processedDisplay / totalDisplay) * 100
                   : 0;
-                const etaDisplay = job ? job.eta_seconds : (selectedLaunchReport?.eta_seconds ?? null);
-                const rawStep = job?.current_step || selectedLaunchReport?.current_step || "";
-                const stepDisplay = progress.isGrouped && /\d+\s*\/\s*\d+/.test(rawStep) ? "" : rawStep;
+                const etaDisplay = selectedLaunchReport?.eta_seconds ?? null;
+                const rawStep = selectedLaunchReport?.current_step || "";
+                const filteredStep = visibleCurrentStep(rawStep) || "";
+                const stepDisplay = progress.isGrouped && /\d+\s*\/\s*\d+/.test(filteredStep) ? "" : filteredStep;
                 const etaLabel = formatEta(etaDisplay);
-                const hasAny = job || selectedLaunchReport;
+                const hasAny = Boolean(selectedLaunchReport);
+                const isRunningNow = selectedLaunchReport?.status === "running";
+                const status = (selectedLaunchReport?.status || "idle") as RingStatus;
+                const ringCenterMain = !hasAny
+                  ? <span className="ring-percent">—</span>
+                  : status === "completed"
+                    ? <span className="ring-percent ring-percent-done">100%</span>
+                    : status === "failed"
+                      ? <span className="ring-percent ring-percent-fail">!</span>
+                      : status === "queued"
+                        ? <span className="ring-percent ring-percent-queue">…</span>
+                        : <AnimatedNumber
+                            className="ring-percent"
+                            value={percentDisplay}
+                            duration={500}
+                            format={(n) => `${n.toFixed(1)}%`}
+                          />;
+                const ringCenterSub = !hasAny
+                  ? null
+                  : status === "queued"
+                    ? <span>{uiText("в очереди")}</span>
+                    : <span>{progress.unit}</span>;
+
+                if (!selectedLaunchReport) {
+                  return (
+                    <Box className="hero-progress hero-progress-empty">
+                      <RingProgress percent={0} status="idle" centerLabel={ringCenterMain} />
+                      <Box className="hero-progress-meta">
+                        <Typography variant="body1" color="text.secondary">{uiText("Ожидание запуска")}</Typography>
+                        <Typography variant="caption" color="text.secondary">{uiText("Загрузите файл и нажмите «Запустить новый анализ»")}</Typography>
+                      </Box>
+                    </Box>
+                  );
+                }
+
                 return (
                   <>
-                    <LinearProgress variant="determinate" value={percentDisplay || 0} />
-                    <Typography sx={{ mt: 1 }}>
-                      {hasAny
-                        ? `${processedDisplay.toLocaleString("ru-RU")} / ${totalDisplay.toLocaleString("ru-RU")} ${progress.unit} (${percentDisplay.toFixed(1)}%)${etaLabel ? ` · ${etaLabel}` : ""}`
-                        : "Ожидание запуска"}
-                    </Typography>
-                    {stepDisplay && (
-                      <Typography color="text.secondary">{stepDisplay}</Typography>
+                    <Box className={`hero-progress hero-progress-${status}`}>
+                      <RingProgress
+                        percent={percentDisplay}
+                        status={status}
+                        centerLabel={ringCenterMain}
+                        centerSubLabel={ringCenterSub}
+                      />
+                      <Box className="hero-progress-meta">
+                        <Box className="meta-numbers">
+                          <AnimatedNumber
+                            className="num-current"
+                            value={processedDisplay}
+                            duration={500}
+                          />
+                          <span className="num-divider">/</span>
+                          <AnimatedNumber
+                            className="num-total"
+                            value={totalDisplay}
+                            duration={500}
+                          />
+                          <span className="meta-unit">{progress.unit}</span>
+                        </Box>
+                        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                          <Chip
+                            size="small"
+                            label={selectedLaunchReport.status_label || statusLabel(selectedLaunchReport.status)}
+                            title={selectedLaunchReport.retry_hint || undefined}
+                            color={selectedLaunchReport.all_rows_failed ? "error" : selectedLaunchReport.has_errors && selectedLaunchReport.status === "completed" ? "warning" : statusColor(selectedLaunchReport.status)}
+                            variant={["running", "completed"].includes(selectedLaunchReport.status) ? "filled" : "outlined"}
+                          />
+                          {etaLabel && (
+                            <Box className="meta-eta">
+                              <span className="live-dot" />
+                              <span>{etaLabel}</span>
+                            </Box>
+                          )}
+                        </Stack>
+                        {stepDisplay && (
+                          <Typography variant="caption" color="text.secondary">{stepDisplay}</Typography>
+                        )}
+                        {progress.isGrouped && <Typography variant="body2">{processedDisplay}{" " + uiText("из") + " "}{totalDisplay}{" " + uiText("групп (")}{percentDisplay.toFixed(1)}%)</Typography>}
+                        {selectedLaunchReport.status === "queued"
+                          && (selectedLaunchReport.personal_queue
+                              || typeof selectedLaunchReport.queue_position === "number") && (
+                          <Typography variant="caption" color="text.secondary">
+                            {formatQueuedHint(selectedLaunchReport)}
+                          </Typography>
+                        )}
+                      </Box>
+                    </Box>
+
+                    <LinearProgress
+                      sx={{ mt: 2 }}
+                      variant="determinate"
+                      value={percentDisplay || 0}
+                      color={progressBarColor(selectedLaunchReport.status)}
+                      className={selectedLaunchReport.status === "paused" ? "lp-paused" : undefined}
+                    />
+
+                    {Array.isArray(selectedLaunchReport.last_logs) && (selectedLaunchReport.last_logs?.length ?? 0) > 0 && (
+                      <Box className="logs-feed">
+                        {(selectedLaunchReport.last_logs ?? []).slice(-14).map((line, idx) => {
+                          const cls = classifyLogLine(line);
+                          return (
+                            <div key={idx} className={`log-line log-${cls}`}>
+                              <span className="log-stripe" />
+                              <span className="log-text">{line}</span>
+                            </div>
+                          );
+                        })}
+                      </Box>
                     )}
-                    {selectedLaunchReport?.status === "queued" && typeof selectedLaunchReport.queue_position === "number" && (
-                      <Typography variant="caption" color="text.secondary" display="block">
-                        {formatQueueHint(selectedLaunchReport.queue_position)}
-                      </Typography>
-                    )}
-                    {isRunning && (
-                      <Typography variant="caption" color="text.secondary">
-                        В работе: {jobElapsedSec} с
-                      </Typography>
+
+                    {isRunningNow && !etaLabel && (
+                      <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: "block" }}>{uiText("В работе")}</Typography>
                     )}
                   </>
                 );
@@ -3764,68 +3463,67 @@ function App() {
         )}
 
         {activeResult?.summary && (
-          <Box ref={resultsBlockRef}>
+          <Box ref={resultsBlockRef} id="analysis-result" className="workspace-section">
           <Card className="card">
-            <CardContent>
-              <Typography variant="h6">{activeResult.title}</Typography>
+              <CardContent>
+              <Typography variant="h6" component="h2">{activeResult.title}</Typography>
+              <ReportQuota report={selectedLaunchReport} />
+              {activeResult.summary.failed_rows > 0 && selectedReportId && <Button sx={{ my: 1 }} variant="outlined"
+                href={`${API_ROOT}/${user.role === "admin" ? "admin/" : ""}reports/${selectedReportId}/download/errors/xlsx`}>{uiText("Скачать список ошибок (xlsx)")}</Button>}
 
               <Stack direction={{ xs: "column", md: "row" }} spacing={2} sx={{ mt: 2 }} alignItems="stretch">
                 {selectedLaunchReport?.group_by_column ? (
-                  <Card variant="outlined" sx={{ flex: 1, minHeight: 110 }}>
+                  <Card variant="outlined" className="stat-card stat-card-neutral" sx={{ flex: 1, minHeight: 110 }}>
                     <CardContent>
-                      <Typography variant="overline" color="text.secondary">Всего групп</Typography>
-                      <Typography variant="h4">
-                        {selectedLaunchReport.group_processed ?? 0}
+                      <Typography variant="overline" color="text.secondary">{uiText("Всего групп")}</Typography>
+                      <Typography component="p" variant="h4">
+                        <AnimatedNumber value={selectedLaunchReport.group_processed ?? 0} />
                         <Typography component="span" variant="body2" color="text.secondary" sx={{ ml: 1 }}>
-                          / {selectedLaunchReport.group_total ?? 0}
+                          / <AnimatedNumber value={selectedLaunchReport.group_total ?? 0} />
                         </Typography>
                       </Typography>
                       <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
-                        {activeResult.summary.total_rows.toLocaleString("ru-RU")} строк · колонка «{selectedLaunchReport.group_by_column}»
+                        {activeResult.summary.total_rows.toLocaleString(uiLocale())}{" " + uiText("строк · колонка «")}{selectedLaunchReport.group_by_column}»
                       </Typography>
                     </CardContent>
                   </Card>
                 ) : (
-                  <Card variant="outlined" sx={{ flex: 1, minHeight: 110 }}>
+                  <Card variant="outlined" className="stat-card stat-card-neutral" sx={{ flex: 1, minHeight: 110 }}>
                     <CardContent>
-                      <Typography variant="overline" color="text.secondary">Всего строк</Typography>
-                      <Typography variant="h4">{activeResult.summary.total_rows}</Typography>
+                      <Typography variant="overline" color="text.secondary">{uiText("Всего строк")}</Typography>
+                      <Typography component="p" variant="h4"><AnimatedNumber value={activeResult.summary.total_rows} /></Typography>
                     </CardContent>
                   </Card>
                 )}
-                <Card variant="outlined" sx={{ flex: 1, minHeight: 110, borderColor: "success.main" }}>
+                <Card variant="outlined" className="stat-card stat-card-success" sx={{ flex: 1, minHeight: 110, borderColor: "success.main" }}>
                   <CardContent>
-                    <Typography variant="overline" color="success.main">Успешно обработано</Typography>
-                    <Typography variant="h4">
-                      {activeResult.summary.success_rows.toLocaleString("ru-RU")}
+                    <Typography variant="overline" color="success.main">{uiText("Успешно обработано")}</Typography>
+                    <Typography component="p" variant="h4">
+                      <AnimatedNumber value={activeResult.summary.success_rows} />
                       {activeResult.summary.total_rows > 0 && (
                         <Typography component="span" variant="body2" color="text.secondary" sx={{ ml: 1 }}>
-                          ({Math.round((activeResult.summary.success_rows / activeResult.summary.total_rows) * 100)}%)
+                          ({((activeResult.summary.success_rows / activeResult.summary.total_rows) * 100).toFixed(1)}%)
                         </Typography>
                       )}
                     </Typography>
                     {Boolean(selectedLaunchReport?.group_by_column) && (
-                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
-                        строк внутри групп
-                      </Typography>
+                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>{uiText("строк внутри групп")}</Typography>
                     )}
                   </CardContent>
                 </Card>
-                <Card variant="outlined" sx={{ flex: 1, minHeight: 110, borderColor: activeResult.summary.failed_rows > 0 ? "error.main" : undefined }}>
+                <Card variant="outlined" className={`stat-card ${activeResult.summary.failed_rows > 0 ? "stat-card-error" : "stat-card-neutral"}`} sx={{ flex: 1, minHeight: 110, borderColor: activeResult.summary.failed_rows > 0 ? "error.main" : undefined }}>
                   <CardContent>
-                    <Typography variant="overline" color={activeResult.summary.failed_rows > 0 ? "error.main" : "text.secondary"}>С ошибками</Typography>
-                    <Typography variant="h4">
-                      {activeResult.summary.failed_rows.toLocaleString("ru-RU")}
+                    <Typography variant="overline" color={activeResult.summary.failed_rows > 0 ? "error.main" : "text.secondary"}>{uiText("С ошибками")}</Typography>
+                    <Typography component="p" variant="h4">
+                      <AnimatedNumber value={activeResult.summary.failed_rows} />
                       {activeResult.summary.total_rows > 0 && activeResult.summary.failed_rows > 0 && (
                         <Typography component="span" variant="body2" color="text.secondary" sx={{ ml: 1 }}>
-                          ({Math.round((activeResult.summary.failed_rows / activeResult.summary.total_rows) * 100)}%)
+                          ({((activeResult.summary.failed_rows / activeResult.summary.total_rows) * 100).toFixed(1)}%)
                         </Typography>
                       )}
                     </Typography>
                     {Boolean(selectedLaunchReport?.group_by_column) && (
-                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
-                        строк внутри групп
-                      </Typography>
+                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>{uiText("строк внутри групп")}</Typography>
                     )}
                   </CardContent>
                 </Card>
@@ -3840,22 +3538,20 @@ function App() {
               </Stack>
 
               {activeResult.inProgress && (!activeResult.previewRows || activeResult.previewRows.length === 0) && (
-                <Alert severity="info" sx={{ mt: 3 }}>
-                  Первые обработанные строки появятся здесь автоматически. Страница обновляется каждые 5 секунд.
-                </Alert>
+                <Alert severity="info" sx={{ mt: 3 }}>{uiText("Первые обработанные строки появятся здесь автоматически. Страница обновляется каждые 5 секунд.")}</Alert>
               )}
 
               {activeResult.previewRows && activeResult.previewRows.length > 0 && (
                 <>
                   <Typography variant="subtitle1" sx={{ mt: 3 }}>
                     {activeResult.inProgress
-                      ? `Промежуточный результат — первые ${activeResult.previewRows.length} обработанных строк`
-                      : `Первые ${activeResult.previewRows.length} обработанных строк`}
+                      ? uiText("Промежуточный результат — первые {0} обработанных строк", activeResult.previewRows.length)
+                      : uiText("Первые {0} обработанных строк", activeResult.previewRows.length)}
                   </Typography>
                   <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
                     {activeResult.inProgress
-                      ? "Обновляется каждые 5 секунд. Проверьте качество промпта на лету — если результат неудовлетворителен, можно поставить на паузу и начать новый отчёт."
-                      : "Превью для быстрой проверки качества промпта. Полные данные — в XLSX-выгрузке."}
+                      ? uiText("Обновляется каждые 5 секунд. Проверьте качество промпта на лету — если результат неудовлетворителен, можно поставить на паузу и начать новый отчёт.")
+                      : uiText("Превью для быстрой проверки качества промпта. Полные данные — в XLSX-выгрузке.")}
                   </Typography>
                   <GrabScrollBox>
                     <Table
@@ -3873,15 +3569,15 @@ function App() {
                           {previewColumnKeys.map((key) => (
                             <TableCell key={key}>{key}</TableCell>
                           ))}
-                          <TableCell>Предупреждения</TableCell>
-                          <TableCell>Ошибка</TableCell>
+                          <TableCell>{uiText("Предупреждения")}</TableCell>
+                          <TableCell>{uiText("Ошибка")}</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
                         {activeResult.previewRows.map((item) => {
                           const renderValue = (value: unknown): string => {
                             if (value === null || value === undefined) return "-";
-                            if (typeof value === "boolean") return value ? "да" : "нет";
+                            if (typeof value === "boolean") return value ? uiText("да") : uiText("нет");
                             if (typeof value === "object") return JSON.stringify(value);
                             return String(value);
                           };
@@ -3931,94 +3627,265 @@ function App() {
           </Card>
           </Box>
         )}
-        <Dialog open={releaseNotesOpen} onClose={() => setReleaseNotesOpen(false)} maxWidth="md" fullWidth>
-          <DialogTitle sx={{ pb: 0.5 }}>
-            Заметки о релизе
-            <IconButton
-              onClick={() => setReleaseNotesOpen(false)}
-              sx={{ position: "absolute", right: 8, top: 8 }}
-              aria-label="Закрыть"
-            >
-              <CloseIcon fontSize="small" />
-            </IconButton>
-          </DialogTitle>
-          {releases.length > 0 && (
-            <Tabs
-              value={activeReleaseTab}
-              onChange={(_, next) => setActiveReleaseTab(next)}
-              variant="scrollable"
-              scrollButtons="auto"
-              sx={{ px: 2, borderBottom: 1, borderColor: "divider" }}
-            >
-              {releases.map((entry, idx) => (
-                <Tab
-                  key={entry.version}
-                  label={
-                    idx === 0 ? (
-                      <Stack direction="row" spacing={0.75} alignItems="center">
-                        <span>{entry.version}</span>
-                        <Chip label="актуальная" size="small" color="primary" sx={{ height: 20, fontSize: "0.7rem" }} />
-                      </Stack>
-                    ) : (
-                      entry.version
-                    )
-                  }
-                  sx={{ textTransform: "none", fontWeight: 600 }}
-                />
-              ))}
-            </Tabs>
-          )}
-          <DialogContent dividers sx={{ minHeight: 320 }}>
-            {releasesLoading && (
-              <Stack alignItems="center" sx={{ py: 4 }}>
-                <LinearProgress sx={{ width: "100%" }} />
-                <Typography variant="caption" color="text.secondary" sx={{ mt: 1 }}>
-                  Загружаем заметки…
-                </Typography>
+
+        {accessState.has_access && (
+        <Card className="card workspace-section" id="my-reports">
+          <CardContent>
+            <Stack direction="row" justifyContent="space-between" alignItems="center">
+              <Typography variant="h6" component="h2">{uiText("Мои отчёты")}</Typography>
+              <Stack direction="row" spacing={0.5} alignItems="center">
+                <Tooltip title={uiText("Обновить")}>
+                  <IconButton size="small" onClick={refreshReportsClick} aria-label={uiText("Обновить")}>
+                    <RefreshIcon fontSize="small" />
+                  </IconButton>
+                </Tooltip>
+                {reports.length > 0 && <Tooltip title={uiText("Удалить все")}>
+                  <span>
+                    <IconButton
+                      size="small"
+                      color="error"
+                      onClick={deleteAllReports}
+                      disabled={!reports.length || deletingAllReports}
+                      aria-label={uiText("Удалить все")}
+                    >
+                      <DeleteOutlineIcon fontSize="small" />
+                    </IconButton>
+                  </span>
+                </Tooltip>}
               </Stack>
+            </Stack>
+            {checkedReportIds.length > 0 && <Button color="error" variant="outlined" sx={{ mt: 1 }} disabled={bulkDeleting}
+              onClick={() => void deleteCheckedReports()}>{uiText("Удалить выбранные (")}{checkedReportIds.length})</Button>}
+            {bulkErrors.map(r => <Alert key={r.id} severity="error" sx={{ mt: 1 }}>{r.id}: {r.message}</Alert>)}
+            {visibleReports.length ? (
+            <TableContainer sx={{ mt: 1, overflowX: "auto" }}>
+            <Table size="small" aria-label={uiText("Мои отчёты")} sx={{ width: "100%", minWidth: reports.length ? 1100 : 0, tableLayout: "fixed" }}>
+              <TableHead>
+                <TableRow>
+                  <TableCell padding="checkbox"><Checkbox inputProps={{ "aria-label": uiText("Выбрать все неактивные отчёты") }}
+                    checked={visibleReports.some(r => !["queued", "running", "paused"].includes(r.status)) && visibleReports.filter(r => !["queued", "running", "paused"].includes(r.status)).every(r => checkedReportIds.includes(r.id))}
+                    onChange={e => setCheckedReportIds(e.target.checked ? visibleReports.filter(r => !["queued", "running", "paused"].includes(r.status)).map(r => r.id) : [])} /></TableCell>
+                  <TableCell sx={{ width: "23%" }}>{uiText("Отчёт")}</TableCell>
+                  <TableCell sx={{ width: "16%" }}>{uiText("Создан")}</TableCell>
+                  <TableCell sx={{ width: "10%" }}>{uiText("Статус")}</TableCell>
+                  <TableCell sx={{ width: "28%" }}>{uiText("Прогресс")}</TableCell>
+                  <TableCell sx={{ width: "4%" }} align="center">{uiText("Инфо")}</TableCell>
+                  <TableCell sx={{ width: "19%" }} align="right">{uiText("Действия")}</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {visibleReports.map((r) => {
+                  const progress = computeReportProgress(r);
+                  const { processed: progressProcessed, total: progressTotal, unit: progressUnit } = progress;
+                  const progressPercent = Math.round(progress.percent * 10) / 10;
+                  const etaLabel = formatEta(r.eta_seconds);
+                  const step = visibleCurrentStep(r.current_step);
+                  const reportTitle = r.name?.trim() || r.source_filename?.trim() || "—";
+                  const hasAnyDownload = Boolean(r.results_file) || Boolean(r.raw_file) || Boolean(r.uploaded_file_id);
+                  const canPartialDownload = r.status === "running" || r.status === "paused";
+                  const isTerminal = r.status === "completed" || r.status === "failed" || r.status === "canceled";
+                  return (
+                    <TableRow key={r.id}>
+                      <TableCell padding="checkbox"><Checkbox inputProps={{ "aria-label": uiText("Выбрать отчёт {0}", reportTitle) }}
+                        disabled={bulkDeleting || !isTerminal} checked={checkedReportIds.includes(r.id)} onChange={e => setCheckedReportIds(prev => e.target.checked ? [...prev, r.id] : prev.filter(id => id !== r.id))} /></TableCell>
+                      <TableCell sx={{ wordBreak: "break-word" }}>
+                        <Typography variant="body2" fontWeight={500}>{reportTitle}</Typography>
+                        <ReportQuota report={r} />
+                      </TableCell>
+                      <TableCell sx={{ whiteSpace: "nowrap" }}>
+                        <Typography variant="caption" color="text.secondary">{fmtDate(r.created_at)}</Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          label={r.status_label || statusLabel(r.status)}
+                          title={r.retry_hint || undefined}
+                          color={r.all_rows_failed ? "error" : r.has_errors && r.status === "completed" ? "warning" : statusColor(r.status)}
+                          variant={r.status === "running" || r.status === "completed" ? "filled" : "outlined"}
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <LinearProgress
+                          aria-label={uiText("Прогресс отчёта")}
+                          variant="determinate"
+                          value={Math.max(0, Math.min(100, progressPercent))}
+                          color={progressBarColor(r.status)}
+                          className={r.status === "paused" ? "lp-paused" : undefined}
+                        />
+                        <Box sx={{ minHeight: "2.4em", mt: 0.25 }}>
+                          {/* Числа на отдельной строке, ETA — на следующей. Так табличный
+                              ряд не «прыгает» по высоте при tick'ах счётчика, когда
+                              «Осталось ~2 ч 4 мин» сменяется на «~1 ч 59 мин» (разная длина). */}
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                            sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                          >
+                            {progressProcessed}/{progressTotal} {uiText(progressUnit)} ({progressPercent.toFixed(1)}%)
+                          </Typography>
+                          {etaLabel && (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                            >
+                              {etaLabel}
+                            </Typography>
+                          )}
+                        </Box>
+                        {step && (
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            {step}
+                          </Typography>
+                        )}
+                        {r.status === "queued" && (r.personal_queue || typeof r.queue_position === "number") && (
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            {formatQueuedHint(r)}
+                          </Typography>
+                        )}
+                      </TableCell>
+                      <TableCell align="center">
+                        <Tooltip
+                          arrow
+                          title={
+                            <Box sx={{ fontSize: 12, lineHeight: 1.6, minWidth: 220 }}>
+                              <Box sx={{ opacity: 0.7, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, mb: 0.5 }}>{uiText("Модель и параметры")}</Box>
+                              <div>{uiText("Модель:") + " "}<b>{r.provider}/{r.model}</b></div>
+                              <div>{uiText("Параллелизм:") + " "}<b>{r.parallelism ?? "-"}</b></div>
+                              <div>{uiText("Лимит строк:") + " "}<b>{r.max_reviews ?? "-"}</b></div>
+                              <div>{uiText("Температура:") + " "}<b>{r.temperature ?? "-"}</b></div>
+                              {r.group_by_column && (<div>{uiText("Группировка:") + " "}<b>{r.group_by_column}</b></div>)}
+                              <Box sx={{ borderTop: "1px solid rgba(255,255,255,0.18)", mt: 1, pt: 1 }} />
+                              <Box sx={{ opacity: 0.7, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, mb: 0.5 }}>{uiText("Использовано токенов")}</Box>
+                              <div>{uiText("Запрос:") + " "}<b>{formatTokenExact(r.prompt_tokens)}</b></div>
+                              <div>{uiText("Ответ:") + " "}<b>{formatTokenExact(r.completion_tokens)}</b></div>
+                              <div>{uiText("Всего:") + " "}<b>{formatTokenExact(r.total_tokens)}</b></div>
+                            </Box>
+                          }
+                        >
+                          <InfoOutlinedIcon fontSize="small" color="action" sx={{ cursor: "help" }} />
+                        </Tooltip>
+                      </TableCell>
+                      <TableCell align="right">
+                        <Stack direction="row" spacing={0.25} justifyContent="flex-end" alignItems="center">
+                          <Tooltip title={uiText("Открыть")}>
+                            <span>
+                              <IconButton
+                                size="small"
+                                color="info"
+                                onClick={() => openReport(r.id)}
+                                disabled={selectedReportLoadingId === r.id}
+                                aria-label={uiText("Открыть")}
+                              >
+                                <OpenInNewIcon fontSize="small" />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                          {r.status === "running" && (
+                            <Tooltip title={uiText("Пауза")}>
+                              <IconButton size="small" color="warning" onClick={() => handleReportAction(r.job_id, "pause")} aria-label={uiText("Пауза")}>
+                                <PauseIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          {r.status === "paused" && (
+                            <Tooltip title={uiText("Продолжить")}>
+                              <IconButton size="small" color="success" onClick={() => handleReportAction(r.job_id, "resume")} aria-label={uiText("Продолжить")}>
+                                <PlayArrowIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          {(r.status === "failed" || r.status === "canceled") && (
+                            <Tooltip title={uiText("Перезапустить (кэш включится принудительно)")}>
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  color="secondary"
+                                  onClick={() => retryReport(r.id, r.job_id)}
+                                  disabled={retryingReportId === r.id}
+                                  aria-label={uiText("Перезапустить")}
+                                >
+                                  <RestartAltIcon fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                          )}
+                          {(r.status === "running" || r.status === "queued" || r.status === "paused") && (
+                            <Tooltip title={uiText("Отменить")}>
+                              <IconButton size="small" color="error" onClick={() => handleReportAction(r.job_id, "cancel")} aria-label={uiText("Отменить")}>
+                                <StopIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          {canPartialDownload && (
+                            <Tooltip title={uiText("Скачать промежуточный срез")}>
+                              <IconButton size="small" color="inherit" onClick={() => openDownloadDialog(r, "partial")} aria-label={uiText("Скачать промежуточный")}>
+                                <DownloadIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          {hasAnyDownload && isTerminal && (
+                            <Tooltip title={uiText("Скачать…")}>
+                              <IconButton size="small" color="success" onClick={() => openDownloadDialog(r, "completed")} aria-label={uiText("Скачать")}>
+                                <DownloadIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          {isTerminal && (
+                            <Tooltip title={uiText("Удалить")}>
+                              <IconButton size="small" color="error" onClick={() => deleteReport(r.id)} aria-label={uiText("Удалить")}>
+                                <DeleteOutlineIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                        </Stack>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+            </TableContainer>
+            ) : (
+              <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>{uiText("Пока нет отчётов")}</Typography>
             )}
-            {!releasesLoading && releasesError && (
-              <Typography variant="body2" color="error">
-                Не удалось загрузить заметки: {releasesError}
-              </Typography>
-            )}
-            {!releasesLoading && !releasesError && releases.length === 0 && (
-              <Typography variant="body2" color="text.secondary">
-                Заметки о релизе пока не опубликованы.
-              </Typography>
-            )}
-            {!releasesLoading && !releasesError && releases.length > 0 && releases[activeReleaseTab] && (
-              <Box
-                sx={{
-                  "& h1, & h2, & h3": { fontWeight: 700, mt: 2, mb: 1 },
-                  "& h1": { fontSize: "1.3rem" },
-                  "& h2": { fontSize: "1.2rem" },
-                  "& h3": { fontSize: "1.05rem" },
-                  "& p": { my: 1, lineHeight: 1.55 },
-                  "& ul, & ol": { pl: 3, my: 1 },
-                  "& li": { mb: 0.5 },
-                  "& code": {
-                    bgcolor: "action.hover",
-                    px: 0.6,
-                    py: 0.1,
-                    borderRadius: 0.5,
-                    fontSize: "0.88em",
-                  },
-                  "& strong": { fontWeight: 600 },
-                  "& hr": { my: 2, border: 0, borderTop: 1, borderColor: "divider" },
-                }}
-              >
-                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1 }}>
-                  {releases[activeReleaseTab].title}
-                </Typography>
-                <ReactMarkdown>{releases[activeReleaseTab].content_md}</ReactMarkdown>
+            {reports.length > 3 && (
+              <Box sx={{ display: "flex", justifyContent: "center", mt: 1.25 }}>
+                <Button
+                  size="small"
+                  variant="text"
+                  onClick={() => setShowAllReports((v) => !v)}
+                  endIcon={showAllReports ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                  sx={{
+                    textTransform: "none",
+                    color: "text.secondary",
+                    fontWeight: 500,
+                    px: 2,
+                    py: 0.5,
+                    borderRadius: 999,
+                    transition: "background-color 180ms ease, color 180ms ease",
+                    "&:hover": {
+                      backgroundColor: (theme) =>
+                        theme.palette.mode === "dark"
+                          ? "rgba(255,255,255,0.06)"
+                          : "rgba(15,23,42,0.04)",
+                      color: "text.primary",
+                    },
+                  }}
+                >
+                  {showAllReports ? uiText("Свернуть") : uiText("Показать ещё {0}", reports.length - 3)}
+                </Button>
               </Box>
             )}
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={() => setReleaseNotesOpen(false)} variant="contained">Закрыть</Button>
-          </DialogActions>
-        </Dialog>
+          </CardContent>
+        </Card>
+        )}
+
+      </Box>
+        {releaseDialog}
+        {rulesDialog}
         <Drawer
           anchor="right"
           open={examplesOpen}
@@ -4026,23 +3893,19 @@ function App() {
           PaperProps={{ sx: { width: { xs: "100%", sm: 380 }, p: 2 } }}
         >
           <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1.5 }}>
-            <Typography variant="h6">Примеры файлов</Typography>
-            <IconButton size="small" onClick={() => setExamplesOpen(false)} aria-label="Закрыть">
+            <Typography variant="h6">{uiText("Примеры файлов")}</Typography>
+            <IconButton size="small" onClick={() => setExamplesOpen(false)} aria-label={uiText("Закрыть")}>
               <CloseIcon fontSize="small" />
             </IconButton>
           </Stack>
-          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 2 }}>
-            Клик по карточке — файл подставится как обычно загруженный, дальше настраиваете шаблон и запускаете.
-          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 2 }}>{uiText("Клик по карточке — файл подставится как обычно загруженный, дальше настраиваете шаблон и запускаете.")}</Typography>
           {examplesLoading && (
             <Stack alignItems="center" sx={{ py: 3 }}>
-              <LinearProgress sx={{ width: "100%" }} />
+              <LinearProgress aria-label={uiText("Загрузка примеров")} sx={{ width: "100%" }} />
             </Stack>
           )}
           {!examplesLoading && examples.length === 0 && (
-            <Typography variant="body2" color="text.secondary">
-              В директории `examples/` нет доступных файлов.
-            </Typography>
+            <Typography variant="body2" color="text.secondary">{uiText("В директории `examples/` нет доступных файлов.")}</Typography>
           )}
           <Stack spacing={1.5}>
             {examples.map((item) => (
@@ -4051,8 +3914,7 @@ function App() {
                   <Typography variant="subtitle2" sx={{ wordBreak: "break-word" }}>
                     {item.name}
                   </Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Размер: {formatBytes(item.size_bytes)}
+                  <Typography variant="caption" color="text.secondary">{uiText("Размер:") + " "}{formatBytes(item.size_bytes)}
                   </Typography>
                 </CardContent>
                 <Stack direction="row" justifyContent="flex-end" sx={{ px: 2, pb: 1.5 }}>
@@ -4062,55 +3924,77 @@ function App() {
                     onClick={() => useExample(item.name)}
                     disabled={exampleLoadingName !== null}
                   >
-                    {exampleLoadingName === item.name ? "Загрузка…" : "Использовать"}
+                    {exampleLoadingName === item.name ? uiText("Загрузка…") : uiText("Использовать")}
                   </Button>
                 </Stack>
               </Card>
             ))}
           </Stack>
         </Drawer>
+        <Dialog fullScreen open={promptFullScreen} onClose={() => setPromptFullScreen(false)}>
+          <DialogTitle>{uiText("Редактор промпта")}</DialogTitle><DialogContent>
+            <TextField fullWidth multiline label={uiText("Промпт")} value={promptEditorValue} onChange={e => setPromptEditorValue(e.target.value)}
+              sx={{ mt: 1, "& textarea": { minHeight: "60vh", fontFamily: "monospace" } }} />
+          </DialogContent><DialogActions><Button variant="contained" onClick={() => setPromptFullScreen(false)}>{uiText("Сохранить и закрыть")}</Button></DialogActions>
+        </Dialog>
+        <Dialog open={!!pendingSettingsPayload} onClose={() => setPendingSettingsPayload(null)} maxWidth="sm" fullWidth>
+          <DialogTitle>{uiText("Проверьте колонки перед запуском")}</DialogTitle><DialogContent>
+            <Typography>{uiText("Поля ответа совпадают с колонками источника, которые не передаются в модель или результат:")}</Typography>
+            <Typography sx={{ my: 2, fontWeight: 600 }}>{settingsWarnings.join(", ")}</Typography>
+            {groupByColumn && <Alert severity="info">{uiText("Справочные колонки будут сохранены без потерь на листе «Исходные данные» с номером группы. В модель их значения не отправляются.")}</Alert>}
+          </DialogContent><DialogActions sx={{ flexDirection: "column", alignItems: "stretch", gap: 1 }}>
+            <Button variant="contained" onClick={() => void resolveSettings("passthrough")}>{uiText("Передать колонку в результат как есть (рекомендуется)")}</Button>
+            <Button onClick={() => void resolveSettings("analysis")}>{uiText("Включить в анализ")}</Button>
+            <Button onClick={() => void resolveSettings("keep")}>{uiText("Запустить как есть")}</Button>
+            <Button color="inherit" onClick={() => setPendingSettingsPayload(null)}>{uiText("Отмена")}</Button>
+          </DialogActions>
+        </Dialog>
+        <Dialog open={!!promptPreview} onClose={() => setPromptPreview(null)} maxWidth="lg" fullWidth>
+          <DialogTitle>{uiText("Что уйдёт в модель")}</DialogTitle><DialogContent>
+            <Alert severity="info">{uiText("Предпросмотр без вызова модели и расхода токенов.")}{promptPreview?.truncated ? " " + uiText("Длинные сообщения сокращены до 50 000 символов.") : ""}{promptPreview && !promptPreview.will_send ? " " + uiText("Первая строка пустая и будет пропущена.") : ""}</Alert>
+            {promptPreview?.messages.map((message, index) => <Box key={index} sx={{ mt: 2 }}><Typography variant="subtitle1">{message.role}</Typography>
+              <Box component="pre" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 13, maxHeight: "35vh", overflow: "auto" }}>{message.content}</Box></Box>)}
+            <Typography variant="subtitle1">{uiText("Схема ответа")}</Typography><Box component="pre" sx={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(promptPreview?.response_schema, null, 2)}</Box>
+          </DialogContent><DialogActions><Button onClick={() => setPromptPreview(null)}>{uiText("Закрыть")}</Button></DialogActions>
+        </Dialog>
         <Dialog open={Boolean(downloadDialog)} onClose={() => setDownloadDialog(null)} maxWidth="sm" fullWidth>
-          <DialogTitle>Скачать отчёт</DialogTitle>
+          <DialogTitle>{uiText("Скачать отчёт")}</DialogTitle>
           <DialogContent>
             {downloadDialog && (
               <Stack spacing={2} sx={{ mt: 1 }}>
                 {(downloadDialog.status === "running" || downloadDialog.status === "paused") && (
-                  <Alert severity="info">
-                    Отчёт ещё обрабатывается. Файл соберётся на лету из уже готовых строк.
-                  </Alert>
+                  <PartialDownloadHint />
                 )}
                 <FormControl>
-                  <Typography variant="subtitle2" sx={{ mb: 1 }}>Формат</Typography>
+                  <Typography variant="subtitle2" sx={{ mb: 1 }}>{uiText("Формат")}</Typography>
                   <RadioGroup
                     value={downloadDialog.format}
                     onChange={(_, value) => setDownloadDialog((prev) => prev ? { ...prev, format: value as "xlsx" | "raw" | "source" } : prev)}
                   >
                     {downloadDialog.hasResults && (
-                      <FormControlLabel value="xlsx" control={<Radio />} label="XLSX (таблица с результатом)" />
+                      <FormControlLabel value="xlsx" control={<Radio />} label={uiText("XLSX (таблица с результатом)")} />
                     )}
                     {downloadDialog.hasRaw && (
-                      <FormControlLabel value="raw" control={<Radio />} label="Сырой JSON (ответы модели + метаданные)" />
+                      <FormControlLabel value="raw" control={<Radio />} label={uiText("Сырой JSON (ответы модели + метаданные)")} />
                     )}
                     {downloadDialog.hasSource && (
-                      <FormControlLabel value="source" control={<Radio />} label="Исходный файл пользователя" />
+                      <FormControlLabel value="source" control={<Radio />} label={uiText("Исходный файл пользователя")} />
                     )}
                   </RadioGroup>
                 </FormControl>
                 <TextField
-                  label="Имя файла"
+                  label={uiText("Имя файла")}
                   value={downloadDialog.filename}
                   onChange={(e) => setDownloadDialog((prev) => prev ? { ...prev, filename: e.target.value } : prev)}
-                  helperText="Без расширения — оно добавится автоматически по выбранному формату. Недопустимые символы заменятся на _."
+                  helperText={uiText("Без расширения — оно добавится автоматически по выбранному формату. Недопустимые символы заменятся на _.")}
                   fullWidth
                 />
               </Stack>
             )}
           </DialogContent>
           <DialogActions>
-            <Button onClick={() => setDownloadDialog(null)}>Отмена</Button>
-            <Button variant="contained" startIcon={<DownloadIcon />} onClick={submitDownload}>
-              Скачать
-            </Button>
+            <Button onClick={() => setDownloadDialog(null)}>{uiText("Отмена")}</Button>
+            <Button variant="contained" startIcon={<DownloadIcon />} onClick={submitDownload}>{uiText("Скачать")}</Button>
           </DialogActions>
         </Dialog>
 
@@ -4134,7 +4018,6 @@ function App() {
             {actionToast?.message || ""}
           </Alert>
         </Snackbar>
-      </Box>
     </Box>
   );
 }

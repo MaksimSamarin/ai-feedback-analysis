@@ -1,8 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 from app.config import GLOBAL_LLM_PARALLELISM
@@ -51,6 +51,10 @@ class AuthResponse(BaseModel):
 
 
 class StartJobRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=200)
+    access_group_id: int | None = None
+    settings_confirmed: bool = False
+    prompt_language: Literal["en", "ru"] | None = None
     file_id: str
     sheet_name: str
     analysis_columns: list[str] = Field(min_length=1)
@@ -109,20 +113,6 @@ class JobResult(BaseModel):
     raw_file: str | None = None
 
 
-class JobStateResponse(BaseModel):
-    job_id: str
-    status: JobStatus
-    created_at: datetime
-    started_at: datetime | None
-    finished_at: datetime | None
-    total: int
-    processed: int
-    progress_percent: float
-    eta_seconds: float | None
-    current_step: str
-    logs: list[str]
-    result: JobResult
-    queue_position: int | None = None
 
 
 class ProviderInfo(BaseModel):
@@ -137,6 +127,7 @@ class ProvidersResponse(BaseModel):
 class ModelsResponse(BaseModel):
     provider: str
     models: list[str]
+    entries: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class VerifyTokenRequest(BaseModel):
@@ -152,12 +143,20 @@ class VerifyTokenResponse(BaseModel):
     models: list[str] = Field(default_factory=list)
 
 
-class EventMessage(BaseModel):
-    type: str
-    payload: dict[str, Any]
 
 
 class ReportItem(BaseModel):
+    access_group_id: int | None = None
+    access_group_name: str | None = None
+    access_group_active: bool | None = None
+    access_group_member: bool = False
+    status_label: str | None = None
+    all_rows_failed: bool = False
+    has_errors: bool = False
+    retry_hint: str | None = None
+    failed_rows: int | None = None
+    success_rows: int | None = None
+    name: str | None = None
     id: str
     job_id: str
     status: str
@@ -180,6 +179,10 @@ class ReportItem(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     queue_position: int | None = None
+    # personal_queue=True → отчёт в личной очереди юзера (превышен MAX_ACTIVE_PER_USER).
+    # status='queued', но в Redis не пушится. Фронт по этому полю показывает
+    # хинт «Ждём пока завершится один из ваших активных отчётов и встанем в очередь».
+    personal_queue: bool = False
     results_file: str | None = None
     raw_file: str | None = None
     summary_json: dict[str, Any] | None = None
@@ -199,6 +202,12 @@ class ReportItem(BaseModel):
     # Для обычных отчётов без группировки оба поля = 0.
     group_total: int = 0
     group_processed: int = 0
+    # Последние ~20 строк лога обработки. Worker пишет их в Redis-list
+    # job_logs:<id> рядом с in-memory job.logs, backend читает оттуда в
+    # /api/reports/active. Используется для блока «3. Обработка» на фронте
+    # вместо устаревшего SSE-канала. Для terminal-отчётов и для отчётов
+    # без активной обработки список может быть пустым (TTL 24 часа).
+    last_logs: list[str] = Field(default_factory=list)
 
 
 class ReportsResponse(BaseModel):
@@ -216,12 +225,19 @@ class UsageResponse(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    groups: list[dict[str, Any]] = Field(default_factory=list)
+    has_access: bool = True
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
 
 
 class UserMeResponse(BaseModel):
     id: int
     username: str
     role: str = "user"
+    full_name: str | None = None
 
 
 class PresetUpsertRequest(BaseModel):
@@ -268,8 +284,11 @@ class AdminFailureItem(BaseModel):
 
 
 class AdminStatsResponse(BaseModel):
+    analysis_workers: int = 0
+    inspect_workers: int = 0
     queue_depth: int = 0
     queued: int = 0
+    personal_queued: int = 0
     running: int = 0
     paused: int = 0
     failed: int = 0

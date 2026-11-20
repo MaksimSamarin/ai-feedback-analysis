@@ -8,7 +8,7 @@ import httpx
 
 from app.config import TLS_VERIFY, get_provider_base_url
 
-from .base import ContextLengthExceeded, LLMProvider
+from .base import ContextLengthExceeded, InvalidLLMResponse, LLMProvider
 
 
 _CONTEXT_EXCEEDED_CODES = {"context_length_exceeded", "string_above_max_length"}
@@ -56,6 +56,18 @@ class OpenAIProvider(LLMProvider):
     id = "openai"
 
     @staticmethod
+    def messages(prompt):
+        return [{"role": "system", "content": "Return only strict JSON. No markdown."},
+                {"role": "user", "content": prompt}]
+
+    @classmethod
+    def request_body(cls, prompt, model, temperature):
+        body = {"model": model, "messages": cls.messages(prompt), "temperature": temperature,
+                "response_format": {"type": "json_object"}}
+        body.update(cls._json_object_env("OPENAI_EXTRA_BODY_JSON"))
+        return body
+
+    @staticmethod
     def _v1_base(base_url: str) -> str:
         base = (base_url or "").rstrip("/")
         return base if base.endswith("/v1") else f"{base}/v1"
@@ -83,19 +95,7 @@ class OpenAIProvider(LLMProvider):
         if not effective_api_key:
             raise ValueError("Для провайдера OpenAI требуется API-ключ")
 
-        body = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Return only strict JSON. No markdown.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": temperature,
-            "response_format": {"type": "json_object"},
-        }
-        body.update(self._json_object_env("OPENAI_EXTRA_BODY_JSON"))
+        body = self.request_body(prompt, model, temperature)
 
         headers = {
             "Authorization": f"Bearer {effective_api_key}",
@@ -138,7 +138,6 @@ class OpenAIProvider(LLMProvider):
                     text_parts.append(part.get("text", ""))
             content = "".join(text_parts)
 
-        data = json.loads(content)
         raw = {
             "provider": self.id,
             "model": model,
@@ -148,5 +147,12 @@ class OpenAIProvider(LLMProvider):
             "content": content,
             "temperature": temperature,
             "base_url": openai_base_url,
+            "reasoning_content": payload["choices"][0]["message"].get("reasoning_content"),
         }
+        if payload["choices"][0].get("finish_reason") == "length":
+            raise InvalidLLMResponse("Ответ обрезан: finish_reason=length", raw)
+        try:
+            data = json.loads(content)
+        except (ValueError, TypeError) as exc:
+            raise InvalidLLMResponse(f"Не JSON: {exc}", raw) from exc
         return data, raw

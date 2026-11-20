@@ -55,8 +55,13 @@ def test_invalid_cache_hit_triggers_delete(monkeypatch) -> None:
     )
 
 
-def test_delete_cached_analysis_removes_redis_and_db(monkeypatch, tmp_path) -> None:
-    """delete_cached_analysis вызывает DELETE в БД и redis.delete для ключа."""
+def test_delete_cached_analysis_removes_db_only(monkeypatch, tmp_path) -> None:
+    """delete_cached_analysis вызывает DELETE в БД и НЕ дёргает Redis.
+
+    Регрессия на v2.1.2 (BUG-19): Redis L1-кэш для llm_cache:* удалён, потому
+    что писался без TTL и накапливался до OOM-kill. Cache теперь только в
+    Postgres, поэтому и delete_cached_analysis ничего не делает в Redis.
+    """
     import app.db as db_mod
 
     redis_calls: list[str] = []
@@ -83,6 +88,9 @@ def test_delete_cached_analysis_removes_redis_and_db(monkeypatch, tmp_path) -> N
 
     db_mod.delete_cached_analysis("abc123")
 
-    assert "llm_cache:abc123" in redis_calls, "Ключ должен удаляться из Redis"
+    assert redis_calls == [], (
+        "После v2.1.2 функция не должна обращаться к Redis "
+        "(L1-кэш удалён, см. test_llm_cache_redis_removed.py)"
+    )
     assert sql_calls and sql_calls[0][0] == "DELETE", "Должен быть DELETE-запрос в БД"
     assert sql_calls[0][1] == ("abc123",), "Параметром должен быть ровно cache_key"

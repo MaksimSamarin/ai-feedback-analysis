@@ -1,10 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import os
-import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -14,34 +13,41 @@ from typing import Any
 import httpx
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-try:
-    from redis import Redis
-except Exception:  # pragma: no cover
-    Redis = None  # type: ignore[assignment]
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse, StreamingResponse
 
 from app import __version__ as APP_VERSION
+from app import access
 from app.auth_utils import hash_password, password_needs_rehash, validate_password_policy, verify_password
+from app import sso, user_profile
 from app.providers.openai_provider import normalize_api_key
 from app.config import (
     DEFAULT_PROMPT,
     GROUP_MAX_ROWS,
     GLOBAL_LLM_PARALLELISM,
+    MAX_ACTIVE_PER_USER,
     MAX_UPLOAD_BYTES,
     MAX_UPLOAD_SIZE_MB,
     PROVIDER_CONFIG,
     RESULTS_DIR,
+    LOCAL_AUTH_ENABLED,
+    LOCAL_REGISTRATION_ENABLED,
+    SSO_REDIRECT_URL,
+    SSO_STATE_TTL_SEC,
     TLS_VERIFY,
     UPLOADS_DIR,
     get_provider_base_url,
+    sso_is_configured,
 )
 from app.crypto_utils import encrypt_text
 from app.db import (
     admin_runtime_stats,
     add_uploaded_file,
+    count_active_slots,
     create_report,
     create_session,
     create_user,
+    get_or_create_sso_user,
+    update_user_password,
     delete_user_preset,
     delete_report,
     delete_session,
@@ -52,7 +58,9 @@ from app.db import (
     get_user_usage,
     get_uploaded_file,
     get_user_by_id,
+    get_ui_language,
     get_redis_client,
+    get_job_logs_bulk,
     build_report_analysis,
     list_report_rows,
     list_recent_report_failures,
@@ -63,19 +71,21 @@ from app.db import (
     list_users_admin,
     list_user_presets,
     list_reports,
-    update_user_password,
     reset_failed_and_skipped_rows,
     reset_report_terminal_state,
+    set_personal_queue,
+    queue_paused_report,
     update_report_progress,
     upsert_user_preset,
     update_report_status,
     update_uploaded_file_inspect,
     iter_report_rows,
-    get_report_summary_agg,
 )
-from app.services.excel_service import export_raw_json, export_results_xlsx
+from app.services.excel_service import export_errors_xlsx
 from app.job_payloads import build_job_payload_from_report
+from app.job_settings import settings_warnings
 from app.queue import (
+    clear_job_dedup_marker,
     enqueue_inspect_job,
     enqueue_job,
     get_inspect_queue_position,
@@ -86,6 +96,7 @@ from app.queue import (
 )
 from app.logging_utils import (
     configure_logging,
+    current_context,
     reset_request_id,
     reset_user_context,
     set_request_id,
@@ -93,18 +104,16 @@ from app.logging_utils import (
 )
 from app.schemas import (
     AdminLogItem,
-    AdminLogsResponse,
     AuthRequest,
     AuthResponse,
+    BulkDeleteRequest,
+    AdminLogsResponse,
     AdminFailureItem,
     AdminStatsResponse,
     AdminUserItem,
     AdminUsersResponse,
     FileInspectResponse,
-    JobResult,
-    JobStateResponse,
     JobStatus,
-    JobSummary,
     ModelsResponse,
     PresetItem,
     PresetsResponse,
@@ -121,7 +130,6 @@ from app.schemas import (
     VerifyTokenRequest,
     VerifyTokenResponse,
 )
-REDIS_URL = os.getenv("REDIS_URL", "").strip()
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "session_token").strip() or "session_token"
 SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "0").strip().lower() in {"1", "true", "yes"}
 BOOTSTRAP_ADMIN_USERNAME = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip()
@@ -140,15 +148,11 @@ NOISY_ACCESS_LOG_PATH_PREFIXES = (
     "/api/health",
 )
 NOISY_ACCESS_LOG_SLOW_MS = max(50, int(os.getenv("NOISY_ACCESS_LOG_SLOW_MS", "250")))
-JOB_EVENTS_REDIS_POLL_TIMEOUT_SEC = max(1.0, float(os.getenv("JOB_EVENTS_REDIS_POLL_TIMEOUT_SEC", "10.0")))
-JOB_EVENTS_KEEPALIVE_SEC = max(5.0, float(os.getenv("JOB_EVENTS_KEEPALIVE_SEC", "15.0")))
-JOB_EVENTS_FALLBACK_POLL_SEC = max(1.0, float(os.getenv("JOB_EVENTS_FALLBACK_POLL_SEC", "5.0")))
-JOB_EVENTS_USE_REDIS = os.getenv("JOB_EVENTS_USE_REDIS", "0").strip().lower() in {"1", "true", "yes"}
 SESSION_USER_CACHE_TTL_SEC = max(0.0, float(os.getenv("SESSION_USER_CACHE_TTL_SEC", "15")))
 SESSION_USER_CACHE_MAX = max(100, int(os.getenv("SESSION_USER_CACHE_MAX", "5000")))
 _SESSION_USER_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
-app = FastAPI(title="Review Analyzer API", version=APP_VERSION)
+app = FastAPI(title="Analyzer API", version=APP_VERSION)
 
 
 logger = logging.getLogger("review_analyzer.api")
@@ -274,6 +278,8 @@ def _normalize_report_row(row: dict[str, Any]) -> ReportItem:
         except Exception:
             non_analysis_columns = None
     base = dict(row)
+    from app.report_outcome import presentation
+    base.update(presentation(row.get("status"), row.get("processed_rows"), row.get("failed_rows")))
     base["summary_json"] = summary
     base["output_schema_json"] = output_schema
     base["expected_json_template_json"] = expected_json_template
@@ -286,16 +292,29 @@ def _normalize_report_row(row: dict[str, Any]) -> ReportItem:
         base["source_filename"] = Path(original_name).stem or original_name
     else:
         base.setdefault("source_filename", None)
-    base["group_total"] = int(base.get("group_total") or 0)
-    base["group_processed"] = int(base.get("group_processed") or 0)
+    base["group_total"] = int(base.get("group_total", base.get("groups_total")) or 0)
+    base["group_processed"] = int(base.get("group_processed", base.get("groups_processed")) or 0)
     return ReportItem(**base)
 
 
 def _normalize_report_row_light(row: dict[str, Any]) -> ReportItem:
     # Lightweight serializer for frequent polling endpoints:
     # avoid JSON decode overhead on large report metadata fields.
+    # ВАЖНО: summary_json НЕ зануляем — это маленький JSON (success_rows,
+    # failed_rows + 2-3 счётчика, ~150 байт), но именно из него фронт
+    # обновляет карточки «Результаты». Worker пишет это поле в БД атомарно
+    # с processed_rows под одним lock'ом — при polling'е фронт всегда читает
+    # согласованный snapshot прогресса и summary.
     base = dict(row)
-    base["summary_json"] = None
+    raw_summary = base.get("summary_json")
+    if raw_summary:
+        try:
+            parsed = json.loads(raw_summary)
+            base["summary_json"] = parsed if isinstance(parsed, dict) else None
+        except Exception:
+            base["summary_json"] = None
+    else:
+        base["summary_json"] = None
     base["output_schema_json"] = None
     base["expected_json_template_json"] = None
     base["input_columns_json"] = None
@@ -307,36 +326,16 @@ def _normalize_report_row_light(row: dict[str, Any]) -> ReportItem:
         base["source_filename"] = Path(original_name).stem or original_name
     else:
         base.setdefault("source_filename", None)
-    # group_total/group_processed приходят из LEFT JOIN в list_reports().
+    # group_total/group_processed приходят из материализованных колонок
+    # reports.groups_total / reports.groups_processed (alias'ы в _REPORTS_LIST_SELECT).
+    # Раньше считались LEFT JOIN'ом по report_rows на каждый запрос — теперь
+    # worker сам поддерживает счётчики в памяти и пишет атомарно с processed_rows.
     # Для обычных отчётов без группировки оба 0.
-    base["group_total"] = int(base.get("group_total") or 0)
-    base["group_processed"] = int(base.get("group_processed") or 0)
+    base["group_total"] = int(base.get("group_total", base.get("groups_total")) or 0)
+    base["group_processed"] = int(base.get("group_processed", base.get("groups_processed")) or 0)
     return ReportItem(**base)
 
 
-def _fetch_ollama_models() -> list[str]:
-    base_url = get_provider_base_url("ollama", "http://localhost:11434")
-    url = f"{base_url}/api/tags"
-    try:
-        with httpx.Client(timeout=10) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            payload = resp.json()
-    except Exception as exc:
-        logger.warning("Failed to fetch Ollama models from %s: %s", url, exc)
-        return []
-
-    models = payload.get("models")
-    if not isinstance(models, list):
-        return []
-
-    out: list[str] = []
-    for item in models:
-        if isinstance(item, dict):
-            name = item.get("name")
-            if isinstance(name, str) and name.strip():
-                out.append(name.strip())
-    return out
 
 
 def _v1_base(base_url: str) -> str:
@@ -600,7 +599,7 @@ init_db()
 def _bootstrap_admin() -> None:
     username = BOOTSTRAP_ADMIN_USERNAME
     password = BOOTSTRAP_ADMIN_PASSWORD
-    if not username or not password:
+    if not LOCAL_AUTH_ENABLED or not username or not password:
         return
     policy_error = validate_password_policy(password)
     if policy_error:
@@ -608,8 +607,8 @@ def _bootstrap_admin() -> None:
         return
     existing = get_user_by_username(username)
     if not existing:
-        create_user(username, hash_password(password), role="admin")
-        logger.info("Bootstrap admin created: username=%s", username)
+        if create_user(username, hash_password(password), role="admin") is not None:
+            logger.info("Bootstrap admin created: username=%s", username)
         return
     if str(existing.get("role") or "") != "admin":
         logger.warning("Bootstrap admin user exists but role is not admin: username=%s", username)
@@ -634,6 +633,7 @@ async def request_context_middleware(request, call_next):
     started = datetime.utcnow()
     request_id = request.headers.get("X-Request-ID", "").strip() or uuid.uuid4().hex[:12]
     req_token = set_request_id(request_id)
+    request_id = current_context()["request_id"]
     auth_header = request.headers.get("Authorization")
     session_token = request.cookies.get(SESSION_COOKIE_NAME)
     token = _parse_token(auth_header) or session_token
@@ -643,19 +643,35 @@ async def request_context_middleware(request, call_next):
         user_obj.get("username") if isinstance(user_obj, dict) else None,
     )
     try:
+        path = request.url.path
+        if (
+            path.startswith("/api/")
+            and path != "/api/health"
+            and not (path in {"/api/release-notes", "/api/ui/settings"} and request.method == "GET")
+            and not path.startswith(("/api/auth/", "/api/access/"))
+        ):
+            if not user_obj:
+                return JSONResponse({"detail": "Требуется авторизация"}, status_code=401)
+            try:
+                await asyncio.to_thread(require_access, user_obj)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
         response = await call_next(request)
         duration_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
-        path_qs = request.url.path
-        if request.url.query:
-            path_qs = f"{path_qs}?{request.url.query}"
         if _should_log_access_request(request.url.path, int(response.status_code), duration_ms):
-            logger.info(
+            access_log = logger.error if response.status_code >= 500 else logger.warning if response.status_code >= 400 else logger.info
+            access_log(
                 "HTTP request: method=%s path=%s status=%s duration_ms=%s",
                 request.method,
-                path_qs,
+                request.url.path,
                 response.status_code,
                 duration_ms,
+                extra={"event_type": "http.request", "status_code": int(response.status_code), "duration_ms": duration_ms},
             )
+        if response.status_code == 200 and "/reports/" in request.url.path and "/download/" in request.url.path:
+            from app.events import record_export
+            report_id = request.url.path.split("/reports/", 1)[1].split("/", 1)[0]
+            await asyncio.to_thread(record_export, report_id, user_obj.get("id") if user_obj else None)
         response.headers["X-Request-ID"] = request_id
         return response
     finally:
@@ -701,8 +717,19 @@ def get_current_user(
 
 
 def require_admin(user: dict = Depends(get_current_user)) -> dict:
-    if str(user.get("role") or "user") != "admin":
+    if str(access.actor(user).get("role") or "user") != "admin":
         raise HTTPException(status_code=403, detail="Требуются права администратора")
+    return user
+
+
+def require_access(user: dict = Depends(get_current_user)) -> dict:
+    if not access.has_access(user):
+        raise HTTPException(403, {"code": "no_access", "message": "Для работы требуется доступ к активной группе"})
+    return user
+
+
+def require_group_manager(group_id: int, user: dict = Depends(require_access)) -> dict:
+    access.require_group_manager(group_id, user)
     return user
 
 
@@ -716,11 +743,15 @@ EXAMPLES_CAP = 5
 _ALLOWED_EXAMPLE_EXT = {".xlsx", ".csv"}
 
 
-def _scan_examples() -> list[dict[str, Any]]:
-    if not EXAMPLES_DIR.exists() or not EXAMPLES_DIR.is_dir():
+def _examples_directory(language: str | None) -> Path:
+    return EXAMPLES_DIR / "en" if (language or get_ui_language()) == "en" else EXAMPLES_DIR
+
+
+def _scan_examples(directory: Path) -> list[dict[str, Any]]:
+    if not directory.is_dir():
         return []
     entries: list[dict[str, Any]] = []
-    for path in sorted(EXAMPLES_DIR.iterdir(), key=lambda p: p.name):
+    for path in sorted(directory.iterdir(), key=lambda p: p.name):
         if not path.is_file():
             continue
         if path.name.startswith("_") or path.name.startswith("."):
@@ -738,9 +769,9 @@ def _scan_examples() -> list[dict[str, Any]]:
 
 
 @app.get("/api/examples")
-def list_examples(user: dict = Depends(get_current_user)) -> dict[str, list[dict[str, Any]]]:
+def list_examples(language: str | None = None, user: dict = Depends(get_current_user)) -> dict[str, list[dict[str, Any]]]:
     _ = user
-    return {"examples": _scan_examples()}
+    return {"examples": _scan_examples(_examples_directory(language))}
 
 
 RELEASE_NOTES_PATH = Path(os.getenv("RELEASE_NOTES_PATH", "/app/docs/RELEASE_NOTES.md"))
@@ -791,25 +822,32 @@ def _parse_release_notes(raw_md: str) -> list[dict[str, str]]:
 
 
 @app.get("/api/release-notes")
-def release_notes(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+def release_notes(language: str = "ru", user: dict = Depends(get_current_user)) -> dict[str, Any]:
     _ = user
-    if not RELEASE_NOTES_PATH.is_file():
+    path = RELEASE_NOTES_PATH
+    if language == "en" and (english_notes := path.with_name("RELEASE_NOTES_EN.md")).is_file():
+        path = english_notes
+    if not path.is_file():
         return {"releases": [], "source_missing": True}
     try:
-        raw = RELEASE_NOTES_PATH.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        logger.warning("Failed to read release notes at %s: %s", RELEASE_NOTES_PATH, exc)
+        logger.warning("Failed to read release notes at %s: %s", path, exc)
         return {"releases": [], "source_missing": True}
     return {"releases": _parse_release_notes(raw), "source_missing": False}
 
 
 @app.get("/api/examples/{name}/download")
-def download_example(name: str, user: dict = Depends(get_current_user)) -> FileResponse:
+def download_example(name: str, language: str | None = None, user: dict = Depends(get_current_user)) -> FileResponse:
     _ = user
-    allowed = {entry["name"] for entry in _scan_examples()}
+    directory = _examples_directory(language)
+    allowed = {entry["name"] for entry in _scan_examples(directory)}
+    if name not in allowed and language is None:
+        directory = EXAMPLES_DIR if directory != EXAMPLES_DIR else EXAMPLES_DIR / "en"
+        allowed = {entry["name"] for entry in _scan_examples(directory)}
     if name not in allowed:
         raise HTTPException(status_code=404, detail="Пример не найден")
-    path = EXAMPLES_DIR / name
+    path = directory / name
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Файл примера отсутствует")
     suffix = path.suffix.lower()
@@ -823,6 +861,8 @@ def download_example(name: str, user: dict = Depends(get_current_user)) -> FileR
 
 @app.post("/api/auth/register", response_model=AuthResponse)
 def register(payload: AuthRequest, response: Response) -> AuthResponse:
+    if not LOCAL_REGISTRATION_ENABLED:
+        raise HTTPException(status_code=404, detail="Регистрация отключена")
     password_error = validate_password_policy(payload.password)
     if password_error:
         logger.warning(
@@ -833,15 +873,9 @@ def register(payload: AuthRequest, response: Response) -> AuthResponse:
         )
         raise HTTPException(status_code=400, detail=password_error)
 
-    if get_user_by_username(payload.username):
-        logger.warning(
-            "Register failed: username=%s reason=user_exists",
-            payload.username,
-            extra={"username": payload.username},
-        )
+    user_id = create_user(payload.username, hash_password(payload.password), join_guest=True)
+    if user_id is None:
         raise HTTPException(status_code=400, detail="Пользователь уже существует")
-
-    user_id = create_user(payload.username, hash_password(payload.password), role="user")
     token = create_session(user_id)
     _cache_session_user(token, {"id": user_id, "username": payload.username, "role": "user"})
     _set_session_cookie(response, token)
@@ -856,8 +890,10 @@ def register(payload: AuthRequest, response: Response) -> AuthResponse:
 
 @app.post("/api/auth/login", response_model=AuthResponse)
 def login(payload: AuthRequest, response: Response) -> AuthResponse:
+    if not LOCAL_AUTH_ENABLED:
+        raise HTTPException(status_code=404, detail="Вход по паролю отключён")
     user = get_user_by_username(payload.username)
-    if not user or not verify_password(payload.password, user["password_hash"]):
+    if not user or not verify_password(payload.password, user["password_hash"] or ""):
         logger.warning(
             "Login failed: username=%s reason=invalid_credentials",
             payload.username,
@@ -905,14 +941,82 @@ def logout(
     return {"status": "ok"}
 
 
+@app.get("/api/auth/config")
+def auth_config() -> dict[str, bool]:
+    return {
+        "sso_enabled": sso_is_configured(),
+        "local_auth_enabled": LOCAL_AUTH_ENABLED,
+        "local_registration_enabled": LOCAL_REGISTRATION_ENABLED,
+    }
+
+
+def _sso_redirect(target: str) -> RedirectResponse:
+    return RedirectResponse(
+        target, status_code=302, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    )
+
+
+@app.get("/api/auth/sso/login")
+def sso_login(
+    return_to: str | None = Query(default=None, max_length=2048),
+    force: bool = Query(default=False),
+) -> RedirectResponse:
+    if not sso_is_configured():
+        raise HTTPException(status_code=404, detail="SSO не настроено")
+    try:
+        url, browser_token = sso.sso_build_authorize_url(return_to, force)
+    except sso.SSOError as exc:
+        logger.warning("OIDC login initialization failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Не удалось начать вход через SSO") from exc
+    redirect = _sso_redirect(url)
+    redirect.set_cookie(
+        sso.FLOW_COOKIE_NAME, browser_token, max_age=SSO_STATE_TTL_SEC, path=sso.CALLBACK_PATH,
+        secure=SESSION_COOKIE_SECURE or SSO_REDIRECT_URL.startswith("https://"), httponly=True, samesite="lax",
+    )
+    return redirect
+
+
+@app.get(sso.CALLBACK_PATH)
+def sso_callback(
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+    browser_token: str = Cookie(default="", alias=sso.FLOW_COOKIE_NAME),
+) -> RedirectResponse:
+    if not sso_is_configured():
+        raise HTTPException(status_code=404, detail="SSO не настроено")
+    try:
+        flow = sso.sso_consume_state(state, browser_token)
+        if error or not code:
+            raise sso.SSOError("Провайдер не завершил вход")
+        identity = sso.sso_exchange_code(code, flow)
+        user = get_or_create_sso_user(
+            identity["issuer"], identity["subject"], identity["username"], identity["login_name"], identity["email"]
+        )
+    except sso.SSOError as exc:
+        logger.warning("OIDC callback failed: %s", exc)
+        return _sso_redirect("/?sso_error=signin_failed")
+
+    user_profile.sync(user["id"], identity["profile"])
+    token = create_session(user["id"])
+    _cache_session_user(token, user)
+    redirect = _sso_redirect(flow["return_to"])
+    redirect.delete_cookie(sso.FLOW_COOKIE_NAME, path=sso.CALLBACK_PATH)
+    _set_session_cookie(redirect, token)
+    logger.info("OIDC login success: user_id=%s", user["id"])
+    return redirect
+
+
 @app.get("/api/auth/me", response_model=UserMeResponse)
 def me(user: dict = Depends(get_current_user)) -> UserMeResponse:
-    return UserMeResponse(id=int(user["id"]), username=str(user["username"]), role=str(user.get("role") or "user"))
+    profile = get_user_by_id(int(user["id"])) or {}
+    return UserMeResponse(full_name=profile.get("full_name"), id=int(user["id"]), username=str(user["username"]), role=str(user.get("role") or "user"))
 
 
 @app.get("/api/auth/usage", response_model=UsageResponse)
 def usage(user: dict = Depends(get_current_user)) -> UsageResponse:
-    return UsageResponse(**get_user_usage(int(user["id"])))
+    state = access.status(user)
+    return UsageResponse(**get_user_usage(int(user["id"])), groups=state["groups"], has_access=state["has_access"])
 
 
 @app.get("/api/admin/users", response_model=AdminUsersResponse)
@@ -944,7 +1048,8 @@ def admin_user_reports(
     if not target:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     rows = list_reports_by_user(target_user_id, limit=limit)
-    return ReportsResponse(reports=[_normalize_report_row_light(row) for row in rows])
+    items = [_normalize_report_row_light(row) for row in rows]
+    return ReportsResponse(reports=_enrich_active_list(items))
 
 
 @app.get("/api/admin/reports/{report_id}/analysis", response_model=ReportAnalysisResponse)
@@ -999,6 +1104,7 @@ def admin_resume_report(report_id: str, admin_user: dict = Depends(require_admin
     row = get_report_any(report_id)
     if not row:
         raise HTTPException(status_code=404, detail="Отчет не найден")
+    access.check_report_limit(row)
     status = str(row.get("status") or "")
     if status in {JobStatus.completed.value, JobStatus.failed.value, JobStatus.canceled.value}:
         return {"status": status}
@@ -1055,6 +1161,8 @@ def admin_resume_report(report_id: str, admin_user: dict = Depends(require_admin
         return {"status": JobStatus.queued.value}
     if status != JobStatus.paused.value:
         raise HTTPException(status_code=409, detail=f"Нельзя возобновить задачу со статусом {status}")
+    if has_running_lease(job_id):
+        raise HTTPException(409, "Завершаются уже отправленные запросы. Повторите возобновление после сохранения результатов.")
 
     payload, err = build_job_payload_from_report(row)
     if err:
@@ -1066,36 +1174,17 @@ def admin_resume_report(report_id: str, admin_user: dict = Depends(require_admin
         )
         return {"status": JobStatus.failed.value}
 
-    queued = enqueue_job(payload)
-    if queued or (job_id and has_queued_marker(job_id)):
-        update_report_status(report_id=report_id, status=JobStatus.queued.value)
-        update_report_progress(
-            report_id=report_id,
-            total_rows=int(row.get("total_rows") or 0),
-            processed_rows=int(row.get("processed_rows") or 0),
-            progress_percent=float(row.get("progress_percent") or 0.0),
-            eta_seconds=row.get("eta_seconds"),
-            current_step="В очереди",
-        )
-        logger.info(
-            "Admin resume queued: admin_id=%s admin_username=%s report_id=%s job_id=%s",
-            admin_user.get("id"),
-            admin_user.get("username"),
-            report_id,
-            job_id,
-        )
+    owner_user_id = int(row["user_id"])
+    owner_slot_free = count_active_slots(owner_user_id) < MAX_ACTIVE_PER_USER
+    if not queue_paused_report(report_id, owner_user_id, personal_queue=not owner_slot_free):
+        raise HTTPException(409, "Состояние отчёта изменилось. Обновите список.")
+    if not owner_slot_free:
         return {"status": JobStatus.queued.value}
-    if job_id and has_running_lease(job_id):
-        update_report_status(report_id=report_id, status=JobStatus.running.value)
-        logger.info(
-            "Admin resume running lease detected: admin_id=%s admin_username=%s report_id=%s job_id=%s",
-            admin_user.get("id"),
-            admin_user.get("username"),
-            report_id,
-            job_id,
-        )
-        return {"status": JobStatus.running.value}
-    return {"status": JobStatus.paused.value}
+    clear_job_dedup_marker(job_id)
+    queued = enqueue_job(payload)
+    if not queued and not has_queued_marker(job_id):
+        raise HTTPException(503, "Не удалось поставить отчёт в очередь. Повторите позже.")
+    return {"status": JobStatus.queued.value}
 
 
 @app.post("/api/admin/reports/{report_id}/cancel")
@@ -1140,8 +1229,8 @@ def admin_delete_report(report_id: str, admin_user: dict = Depends(require_admin
     target_user_id = int(row.get("user_id") or 0)
     if target_user_id <= 0:
         raise HTTPException(status_code=400, detail="Некорректный owner отчета")
-    if not delete_report(report_id, target_user_id):
-        raise HTTPException(status_code=404, detail="Отчет не найден")
+    if not delete_report(report_id, target_user_id, deleted_by=int(admin_user["id"]), reason="admin"):
+        raise HTTPException(status_code=409, detail="Завершаются запросы обработки отчёта. Повторите удаление позже.")
     logger.info(
         "Admin report deleted: admin_id=%s admin_username=%s report_id=%s target_user_id=%s",
         admin_user.get("id"),
@@ -1236,15 +1325,7 @@ def admin_download_report_partial_xlsx(
     status = str(row.get("status") or "")
     if status not in {JobStatus.running.value, JobStatus.paused.value, JobStatus.queued.value}:
         raise HTTPException(status_code=409, detail="Промежуточная выгрузка доступна только для активных отчётов")
-    prompt_example = str(row.get("prompt_template") or "") or None
-    tmp_path = _build_partial_results_payload(report_id, prompt_example)
-    background.add_task(_delete_path_later, tmp_path)
-    download_name = _sanitize_download_filename(filename, fallback=f"report_{report_id[:8]}_partial", extension="xlsx")
-    return FileResponse(
-        tmp_path,
-        filename=download_name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    return _partial_download(row, "xlsx", background, filename)
 
 
 @app.get("/api/admin/reports/{report_id}/download/partial/raw")
@@ -1261,22 +1342,7 @@ def admin_download_report_partial_raw(
     status = str(row.get("status") or "")
     if status not in {JobStatus.running.value, JobStatus.paused.value, JobStatus.queued.value}:
         raise HTTPException(status_code=409, detail="Промежуточная выгрузка доступна только для активных отчётов")
-    provider = str(row.get("provider") or "")
-    model = str(row.get("model") or "")
-    prompt_template = str(row.get("prompt_template") or "")
-    tmp_path = _build_partial_raw_payload(
-        report_id,
-        provider=provider,
-        model=model,
-        prompt_template=prompt_template,
-    )
-    background.add_task(_delete_path_later, tmp_path)
-    download_name = _sanitize_download_filename(filename, fallback=f"report_{report_id[:8]}_partial", extension="json")
-    return FileResponse(
-        tmp_path,
-        filename=download_name,
-        media_type="application/json",
-    )
+    return _partial_download(row, "json", background, filename)
 
 
 @app.get("/api/admin/stats", response_model=AdminStatsResponse)
@@ -1302,9 +1368,20 @@ def admin_stats(admin_user: dict = Depends(require_admin)) -> AdminStatsResponse
             queue_depth = int(client.llen(os.getenv("REDIS_QUEUE_KEY", "review_analyzer:jobs")) or 0)
         except Exception:
             queue_depth = 0
+    presence = {'analysis':0,'inspect':0}
+    if client is not None:
+        try:
+            for key in client.scan_iter(match='review_analyzer:presence:*',count=100):
+                mode=client.get(key)
+                if isinstance(mode,bytes):mode=mode.decode()
+                if mode in presence:presence[mode]+=1
+        except Exception:
+            pass
     return AdminStatsResponse(
+        analysis_workers=presence['analysis'],inspect_workers=presence['inspect'],
         queue_depth=queue_depth,
         queued=int(runtime.get("queued") or 0),
+        personal_queued=int(runtime.get("personal_queued") or 0),
         running=int(runtime.get("running") or 0),
         paused=int(runtime.get("paused") or 0),
         failed=int(runtime.get("failed") or 0),
@@ -1406,24 +1483,24 @@ def remove_preset(preset_id: str, user: dict = Depends(get_current_user)) -> dic
 
 @app.get("/api/providers", response_model=ProvidersResponse)
 def providers() -> ProvidersResponse:
-    items = [ProviderInfo(id=key, label=value["label"]) for key, value in PROVIDER_CONFIG.items()]
+    from app.model_catalog import all_models
+    enabled = [r for r in all_models() if r['is_enabled']]
+    configured = {r['provider'] for r in enabled}
+    items = [ProviderInfo(id=key,label=PROVIDER_CONFIG.get(key,{}).get('label',key)) for key in sorted(configured)]
+    primary = next((r['provider'] for r in enabled if r['is_default']), None)
+    items.sort(key=lambda item: item.id != primary)
     logger.info("Providers listed: count=%s", len(items))
     return ProvidersResponse(providers=items)
 
 
 @app.get("/api/models", response_model=ModelsResponse)
 def models(provider: str = Query(...)) -> ModelsResponse:
-    conf = PROVIDER_CONFIG.get(provider)
-    if not conf:
-        logger.warning("Models failed: provider=%s reason=not_found", provider)
-        raise HTTPException(status_code=404, detail="Провайдер не найден")
-    if provider == "ollama":
-        dynamic_models = _fetch_ollama_models()
-        if dynamic_models:
-            logger.info("Models listed: provider=%s source=dynamic count=%s", provider, len(dynamic_models))
-            return ModelsResponse(provider=provider, models=dynamic_models)
-    logger.info("Models listed: provider=%s source=config count=%s", provider, len(conf["models"]))
-    return ModelsResponse(provider=provider, models=conf["models"])
+    from app.model_catalog import public_models
+    if provider not in {'openai','ollama'}:
+        raise HTTPException(404, "Провайдер не найден")
+    entries = public_models(provider)
+    return ModelsResponse(provider=provider, models=[r['model'] for r in entries], entries=entries)
+
 
 
 @app.post("/api/providers/verify-token", response_model=VerifyTokenResponse)
@@ -1546,13 +1623,13 @@ async def verify_provider_token(payload: VerifyTokenRequest, user: dict = Depend
 
 @app.post("/api/file/inspect", response_model=FileInspectResponse)
 async def file_inspect(file: UploadFile = File(...), user: dict = Depends(get_current_user)) -> FileInspectResponse:
-    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+    if not file.filename or Path(file.filename).suffix.lower() not in {".xlsx", ".csv"}:
         logger.warning("File inspect failed: filename=%s reason=unsupported_extension", file.filename)
-        raise HTTPException(status_code=400, detail="Поддерживаются только файлы .xlsx")
+        raise HTTPException(status_code=400, detail="Поддерживаются файлы XLSX и CSV (UTF-8 или Windows-1251)")
 
     logger.info("File inspect started: filename=%s", file.filename)
     file_id = str(uuid.uuid4())
-    dest = UPLOADS_DIR / f"{file_id}.xlsx"
+    dest = UPLOADS_DIR / f"{file_id}{Path(file.filename).suffix.lower()}"
     written = 0
     chunk_size = 1024 * 1024
     try:
@@ -1633,6 +1710,10 @@ async def file_inspect_status(file_id: str, user: dict = Depends(get_current_use
 
 @app.post("/api/jobs")
 async def start_job(payload: StartJobRequest, user: dict = Depends(get_current_user)) -> dict[str, str]:
+    from app.model_catalog import require_enabled
+    await asyncio.to_thread(require_enabled, payload.provider, payload.model)
+    access_group_id = await asyncio.to_thread(access.pick_group, user, payload.access_group_id)
+    await asyncio.to_thread(access.check_limit, int(user["id"]), access_group_id)
     analysis_columns = [str(col).strip() for col in payload.analysis_columns if str(col).strip()]
     non_analysis_columns = [str(col).strip() for col in (payload.non_analysis_columns or []) if str(col).strip()]
     user_id = int(user["id"])
@@ -1659,20 +1740,6 @@ async def start_job(payload: StartJobRequest, user: dict = Depends(get_current_u
             raise HTTPException(status_code=400, detail=f"Файл не готов: {detail}")
         raise HTTPException(status_code=409, detail="Файл еще подготавливается, дождитесь завершения проверки")
 
-    if payload.provider not in PROVIDER_CONFIG:
-        logger.warning("Job start failed: reason=unsupported_provider provider=%s", payload.provider)
-        raise HTTPException(status_code=400, detail="Неподдерживаемый провайдер")
-
-    allowed_models = PROVIDER_CONFIG[payload.provider]["models"]
-    if payload.provider == "ollama":
-        dynamic_models = _fetch_ollama_models()
-        if dynamic_models:
-            allowed_models = dynamic_models
-
-    if payload.model not in allowed_models:
-        logger.warning("Job start failed: reason=model_unavailable provider=%s model=%s", payload.provider, payload.model)
-        raise HTTPException(status_code=400, detail="Модель недоступна для выбранного провайдера")
-
     if payload.analysis_mode == "custom":
         if payload.expected_json_template is None:
             raise HTTPException(status_code=400, detail="Для custom режима заполните Ожидаемый JSON")
@@ -1693,19 +1760,16 @@ async def start_job(payload: StartJobRequest, user: dict = Depends(get_current_u
     if group_by_column and group_by_column not in analysis_columns:
         logger.warning("Job start failed: reason=group_column_not_in_input group_by_column=%s", group_by_column)
         raise HTTPException(status_code=400, detail="Колонка группировки должна входить в колонки для анализа")
-    if group_by_column and non_analysis_columns:
-        logger.warning(
-            "Non-analysis columns ignored due to grouping: group_by_column=%s dropped=%s",
-            group_by_column,
-            non_analysis_columns,
-        )
-        non_analysis_columns = []
     if group_by_column:
-        # Колонку группировки всегда тащим в итоговый отчёт: её значение внутри
-        # группы одинаково по определению, дубля/неоднозначности нет, а пользователю
-        # нужно видеть по какому ключу модель делала групповой анализ.
-        non_analysis_columns = [group_by_column]
+        non_analysis_columns = list(dict.fromkeys([group_by_column, *non_analysis_columns]))
     group_max_rows = GROUP_MAX_ROWS
+
+    try:
+        warnings = settings_warnings(payload.expected_json_template, file_meta, payload.sheet_name, analysis_columns, non_analysis_columns)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if warnings and not payload.settings_confirmed:
+        raise HTTPException(409, {"code": "settings_warning", "message": "Поля ответа совпадают с колонками, которые не передаются в обработку или результат.", "fields": warnings})
 
     effective_api_key = ""
     if payload.provider == "openai":
@@ -1721,8 +1785,17 @@ async def start_job(payload: StartJobRequest, user: dict = Depends(get_current_u
         if payload.save_api_key_for_resume:
             persisted_api_key_encrypted = queued_api_key_encrypted
 
+    prompt_language = payload.prompt_language or await asyncio.to_thread(get_ui_language)
     job_id = str(uuid.uuid4())
     report_id = job_id
+
+    # Per-user concurrency limit: если у юзера уже MAX_ACTIVE_PER_USER занятых
+    # слотов (running + queued в общей очереди, paused НЕ считается),
+    # отчёт идёт в личную очередь — status='queued', personal_queue=TRUE,
+    # в Redis НЕ пушим. Промоут в общую — автоматически на освобождении слота
+    # (см. update_report_status → try_promote_after_slot_freed).
+    slot_free = (await asyncio.to_thread(count_active_slots, user_id)) < MAX_ACTIVE_PER_USER
+
     await asyncio.to_thread(
         create_report,
         report_id=report_id,
@@ -1737,6 +1810,7 @@ async def start_job(payload: StartJobRequest, user: dict = Depends(get_current_u
         temperature=payload.temperature,
         uploaded_file_id=payload.file_id,
         prompt_template=payload.prompt_template,
+        prompt_language=prompt_language,
         include_raw_json=payload.include_raw_json,
         api_key_encrypted=persisted_api_key_encrypted,
         analysis_mode=payload.analysis_mode,
@@ -1747,35 +1821,40 @@ async def start_job(payload: StartJobRequest, user: dict = Depends(get_current_u
         group_by_column=group_by_column,
         group_max_rows=group_max_rows,
         use_cache=payload.use_cache,
+        personal_queue=not slot_free,
+        access_group_id=access_group_id,
+        name=(payload.name or "").strip() or Path(str(file_meta.get("original_name") or "Отчёт")).stem[:200],
     )
 
-    enqueue_job(
-        {
-            "job_id": job_id,
-            "report_id": report_id,
-            "user_id": user_id,
-            "file_id": payload.file_id,
-            "provider": payload.provider,
-            "model": payload.model,
-            "prompt_template": payload.prompt_template,
-            "sheet_name": payload.sheet_name,
-            "analysis_columns": analysis_columns,
-            "non_analysis_columns": non_analysis_columns,
-            "analysis_mode": payload.analysis_mode,
-            "output_schema": effective_output_schema,
-            "expected_json_template": payload.expected_json_template,
-            "group_by_column": group_by_column,
-            "group_max_rows": group_max_rows,
-            "max_reviews": payload.max_reviews,
-            "parallelism": payload.parallelism,
-            "temperature": payload.temperature,
-            "include_raw_json": payload.include_raw_json,
-            "use_cache": payload.use_cache,
-            "api_key_encrypted": queued_api_key_encrypted,
-        }
-    )
+    if slot_free:
+        enqueue_job(
+            {
+                "job_id": job_id,
+                "report_id": report_id,
+                "user_id": user_id,
+                "file_id": payload.file_id,
+                "provider": payload.provider,
+                "model": payload.model,
+                "prompt_template": payload.prompt_template,
+                "prompt_language": prompt_language,
+                "sheet_name": payload.sheet_name,
+                "analysis_columns": analysis_columns,
+                "non_analysis_columns": non_analysis_columns,
+                "analysis_mode": payload.analysis_mode,
+                "output_schema": effective_output_schema,
+                "expected_json_template": payload.expected_json_template,
+                "group_by_column": group_by_column,
+                "group_max_rows": group_max_rows,
+                "max_reviews": payload.max_reviews,
+                "parallelism": payload.parallelism,
+                "temperature": payload.temperature,
+                "include_raw_json": payload.include_raw_json,
+                "use_cache": payload.use_cache,
+                "api_key_encrypted": queued_api_key_encrypted,
+            }
+        )
     logger.info(
-        "Job started: user_id=%s username=%s report_id=%s provider=%s model=%s max_reviews=%s parallelism=%s temperature=%s",
+        "Job started: user_id=%s username=%s report_id=%s provider=%s model=%s max_reviews=%s parallelism=%s temperature=%s personal_queue=%s",
         int(user["id"]),
         user.get("username"),
         report_id,
@@ -1784,6 +1863,7 @@ async def start_job(payload: StartJobRequest, user: dict = Depends(get_current_u
         payload.max_reviews,
         payload.parallelism,
         payload.temperature,
+        not slot_free,
     )
     return {"job_id": job_id, "report_id": report_id}
 
@@ -1797,50 +1877,6 @@ def _require_job_owner(job_id: str, user_id: int):
 
 async def _require_job_owner_async(job_id: str, user_id: int):
     return await asyncio.to_thread(_require_job_owner, job_id, user_id)
-
-
-@app.get("/api/jobs/{job_id}", response_model=JobStateResponse)
-def job_status(job_id: str, user: dict = Depends(get_current_user)) -> JobStateResponse:
-    row = _require_job_owner(job_id, int(user["id"]))
-    total = int(row.get("total_rows") or 0)
-    processed = int(row.get("processed_rows") or 0)
-    progress = float(row.get("progress_percent") or 0.0)
-    summary_payload = None
-    raw_summary = row.get("summary_json")
-    if raw_summary:
-        try:
-            parsed = json.loads(raw_summary)
-            if isinstance(parsed, dict):
-                summary_payload = parsed
-        except Exception:
-            summary_payload = None
-    result = JobResult(summary=JobSummary(**summary_payload) if summary_payload else None)
-    if row.get("results_file"):
-        result.results_file = str(row.get("results_file"))
-    if row.get("raw_file"):
-        result.raw_file = str(row.get("raw_file"))
-    status_value = str(row.get("status") or JobStatus.queued.value)
-    queue_position: int | None = None
-    if status_value == JobStatus.queued.value:
-        try:
-            queue_position = get_job_queue_position(job_id)
-        except Exception:
-            queue_position = None
-    return JobStateResponse(
-        job_id=job_id,
-        status=JobStatus(status_value),
-        created_at=datetime.fromisoformat(str(row.get("created_at"))),
-        started_at=None,
-        finished_at=datetime.fromisoformat(str(row["finished_at"])) if row.get("finished_at") else None,
-        total=total,
-        processed=processed,
-        progress_percent=progress,
-        eta_seconds=float(row.get("eta_seconds")) if row.get("eta_seconds") is not None else None,
-        current_step=str(row.get("current_step") or ""),
-        logs=[],
-        result=result,
-        queue_position=queue_position,
-    )
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -1895,6 +1931,10 @@ async def pause_job(job_id: str, user: dict = Depends(get_current_user)) -> dict
 @app.post("/api/jobs/{job_id}/resume")
 async def resume_job(job_id: str, user: dict = Depends(get_current_user)) -> dict[str, str]:
     row = await _require_job_owner_async(job_id, int(user["id"]))
+    if row.get('status') in {'queued','paused'}:
+        from app.model_catalog import require_enabled
+        await asyncio.to_thread(require_enabled, row['provider'], row['model'], resume=True)
+    await asyncio.to_thread(access.check_report_limit, row)
     status = str(row.get("status") or "")
     if status in {JobStatus.completed.value, JobStatus.failed.value, JobStatus.canceled.value}:
         return {"status": status}
@@ -1953,6 +1993,8 @@ async def resume_job(job_id: str, user: dict = Depends(get_current_user)) -> dic
         return {"status": JobStatus.queued.value}
     if status != JobStatus.paused.value:
         raise HTTPException(status_code=409, detail=f"Нельзя возобновить задачу со статусом {status}")
+    if await asyncio.to_thread(has_running_lease, job_id):
+        raise HTTPException(409, "Завершаются уже отправленные запросы. Повторите возобновление после сохранения результатов.")
 
     payload, err = build_job_payload_from_report(row)
     if err:
@@ -1965,41 +2007,18 @@ async def resume_job(job_id: str, user: dict = Depends(get_current_user)) -> dic
         )
         return {"status": JobStatus.failed.value}
 
-    queued = enqueue_job(payload)
-    # enqueue_job can return False when this job is already present in queue
-    # (dedup marker exists). In that case, resume is still valid and we should
-    # reflect it in DB status, otherwise UI keeps showing "paused".
-    if queued or has_queued_marker(job_id):
-        await asyncio.to_thread(update_report_status, report_id=str(row["id"]), status=JobStatus.queued.value)
-        await asyncio.to_thread(
-            update_report_progress,
-            report_id=str(row["id"]),
-            total_rows=int(row.get("total_rows") or 0),
-            processed_rows=int(row.get("processed_rows") or 0),
-            progress_percent=float(row.get("progress_percent") or 0.0),
-            eta_seconds=row.get("eta_seconds"),
-            current_step="В очереди",
-        )
-        logger.info(
-            "User resume queued: user_id=%s username=%s report_id=%s job_id=%s",
-            user.get("id"),
-            user.get("username"),
-            row.get("id"),
-            job_id,
-        )
+    owner_user_id = int(row["user_id"])
+    slot_free = (await asyncio.to_thread(count_active_slots, owner_user_id)) < MAX_ACTIVE_PER_USER
+    claimed = await asyncio.to_thread(queue_paused_report, str(row["id"]), owner_user_id, personal_queue=not slot_free)
+    if not claimed:
+        raise HTTPException(409, "Состояние отчёта изменилось. Обновите список.")
+    if not slot_free:
         return {"status": JobStatus.queued.value}
-    if has_running_lease(job_id):
-        await asyncio.to_thread(update_report_status, report_id=str(row["id"]), status=JobStatus.running.value)
-        logger.info(
-            "User resume running lease detected: user_id=%s username=%s report_id=%s job_id=%s",
-            user.get("id"),
-            user.get("username"),
-            row.get("id"),
-            job_id,
-        )
-        return {"status": JobStatus.running.value}
-    # Fallback: keep paused if we couldn't enqueue and don't see a running lease.
-    return {"status": JobStatus.paused.value}
+    await asyncio.to_thread(clear_job_dedup_marker, job_id)
+    queued = await asyncio.to_thread(enqueue_job, payload)
+    if not queued and not await asyncio.to_thread(has_queued_marker, job_id):
+        raise HTTPException(503, "Не удалось поставить отчёт в очередь. Повторите позже.")
+    return {"status": JobStatus.queued.value}
 
 
 @app.post("/api/jobs/{job_id}/retry")
@@ -2011,6 +2030,10 @@ async def retry_job(job_id: str, user: dict = Depends(get_current_user)) -> dict
     очередь. Уже обработанные строки пропускаются на уровне БД.
     """
     row = await _require_job_owner_async(job_id, int(user["id"]))
+    if row.get('status') in {'queued','paused'}:
+        from app.model_catalog import require_enabled
+        await asyncio.to_thread(require_enabled, row['provider'], row['model'], resume=True)
+    await asyncio.to_thread(access.check_report_limit, row)
     status = str(row.get("status") or "")
     if status == JobStatus.completed.value:
         raise HTTPException(status_code=409, detail="Отчёт уже завершён — перезапуск не нужен")
@@ -2024,8 +2047,20 @@ async def retry_job(job_id: str, user: dict = Depends(get_current_user)) -> dict
     # на уже обработанные строки, даже если исходный запуск был с use_cache=false.
     payload["use_cache"] = True
 
-    if not enqueue_job(payload):
-        raise HTTPException(status_code=503, detail="Очередь задач недоступна")
+    # Снимаем dedup-маркер на случай краш-сценария (воркер упал между dequeue и
+    # delete маркера → маркер сирота → enqueue вернёт False до истечения TTL).
+    # На failed/canceled маркер в норме уже снят, лишний DELETE безвреден.
+    await asyncio.to_thread(clear_job_dedup_marker, job_id)
+
+    # Per-user concurrency limit: terminal→queued это новое занятие slot'а.
+    # Если у юзера уже >=MAX_ACTIVE_PER_USER занятых — кладём в личную очередь,
+    # в Redis НЕ пушим. Промоут произойдёт автоматом при освобождении slot'а.
+    user_id = int(user["id"])
+    slot_free = (await asyncio.to_thread(count_active_slots, user_id)) < MAX_ACTIVE_PER_USER
+
+    if slot_free:
+        if not enqueue_job(payload):
+            raise HTTPException(status_code=503, detail="Очередь задач недоступна")
 
     await asyncio.to_thread(reset_report_terminal_state, str(row["id"]))
     # Возвращаем в pending строки с error и с warning skipped_large_group —
@@ -2044,6 +2079,9 @@ async def retry_job(job_id: str, user: dict = Depends(get_current_user)) -> dict
         status=JobStatus.queued.value,
         current_step="Перезапуск: в очереди",
     )
+    if not slot_free:
+        # Помечаем личной очередью — отчёт не в Redis, ждёт promote.
+        await asyncio.to_thread(set_personal_queue, str(row["id"]), True)
     await asyncio.to_thread(
         update_report_progress,
         report_id=str(row["id"]),
@@ -2054,92 +2092,15 @@ async def retry_job(job_id: str, user: dict = Depends(get_current_user)) -> dict
         current_step="Перезапуск: в очереди",
     )
     logger.info(
-        "User retry queued: user_id=%s username=%s report_id=%s job_id=%s previous_status=%s",
+        "User retry queued: user_id=%s username=%s report_id=%s job_id=%s previous_status=%s personal_queue=%s",
         user.get("id"),
         user.get("username"),
         row.get("id"),
         job_id,
         status,
+        not slot_free,
     )
     return {"status": JobStatus.queued.value}
-
-
-@app.get("/api/jobs/{job_id}/events")
-async def job_events(job_id: str, user: dict = Depends(get_current_user)) -> StreamingResponse:
-    await _require_job_owner_async(job_id, int(user["id"]))
-
-    async def event_gen():
-        if JOB_EVENTS_USE_REDIS and REDIS_URL and Redis is not None:
-            client = Redis.from_url(REDIS_URL, decode_responses=True)
-            pubsub = client.pubsub(ignore_subscribe_messages=True)
-            try:
-                pubsub.subscribe(f"job_events:{job_id}")
-                last_keepalive_ts = 0.0
-                while True:
-                    message = await asyncio.to_thread(pubsub.get_message, JOB_EVENTS_REDIS_POLL_TIMEOUT_SEC)
-                    if message and message.get("type") == "message" and isinstance(message.get("data"), str):
-                        payload = message["data"]
-                        yield f"data: {payload}\n\n"
-                        try:
-                            parsed = json.loads(payload)
-                            status = str((parsed.get("payload") or {}).get("status") or "")
-                            if status in {JobStatus.completed.value, JobStatus.failed.value, JobStatus.canceled.value}:
-                                break
-                        except Exception:
-                            pass
-                    else:
-                        now_ts = asyncio.get_running_loop().time()
-                        if now_ts - last_keepalive_ts >= JOB_EVENTS_KEEPALIVE_SEC:
-                            keepalive = {"type": "keepalive", "payload": {"ts": datetime.utcnow().isoformat()}}
-                            yield f"data: {json.dumps(keepalive)}\n\n"
-                            last_keepalive_ts = now_ts
-                return
-            finally:
-                pubsub.close()
-                client.close()
-
-        last_status = None
-        last_processed = None
-        last_total = None
-        last_step = None
-        last_emit_ts = 0.0
-        while True:
-            row = await _require_job_owner_async(job_id, int(user["id"]))
-            status = str(row.get("status") or JobStatus.queued.value)
-            payload = {
-                "status": status,
-                "processed": int(row.get("processed_rows") or 0),
-                "total": int(row.get("total_rows") or 0),
-                "current_step": str(row.get("current_step") or ""),
-                "logs": [],
-            }
-            now_ts = asyncio.get_running_loop().time()
-            changed = (
-                last_status is None
-                or status != last_status
-                or payload["processed"] != last_processed
-                or payload["total"] != last_total
-                or payload["current_step"] != last_step
-            )
-            should_emit_keepalive = (now_ts - last_emit_ts) >= JOB_EVENTS_KEEPALIVE_SEC
-            if changed:
-                event_type = "snapshot" if last_status is None else "progress"
-                yield f"data: {json.dumps({'type': event_type, 'payload': payload}, ensure_ascii=False)}\n\n"
-                last_emit_ts = now_ts
-            elif should_emit_keepalive:
-                keepalive = {"type": "keepalive", "payload": {"ts": datetime.utcnow().isoformat()}}
-                yield f"data: {json.dumps(keepalive)}\n\n"
-                last_emit_ts = now_ts
-            last_status = status
-            last_processed = payload["processed"]
-            last_total = payload["total"]
-            last_step = payload["current_step"]
-            if status in {JobStatus.completed.value, JobStatus.failed.value, JobStatus.canceled.value}:
-                yield f"data: {json.dumps({'type': 'done', 'payload': payload}, ensure_ascii=False)}\n\n"
-                break
-            await asyncio.sleep(JOB_EVENTS_FALLBACK_POLL_SEC)
-
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 def _build_queue_position_map(items: list[ReportItem]) -> dict[str, int]:
@@ -2179,18 +2140,38 @@ def _enrich_with_queue_positions(items: list[ReportItem]) -> list[ReportItem]:
     return items
 
 
+def _enrich_with_last_logs(items: list[ReportItem]) -> list[ReportItem]:
+    """Подтягивает последние логи из Redis-list job_logs:<id> для каждого отчёта.
+
+    Один pipeline-запрос на все job_id'ы — без N+1 round-trip'ов. Для отчётов
+    в терминальных статусах список может быть пустым (TTL Redis-list 24 часа,
+    после чего ключ исчезает; завершённые задачи не пишут новых строк).
+    """
+    job_ids = [it.job_id for it in items if it.job_id]
+    if not job_ids:
+        return items
+    logs_map = get_job_logs_bulk(job_ids, limit=20)
+    for item in items:
+        item.last_logs = logs_map.get(item.job_id, []) if item.job_id else []
+    return items
+
+
+def _enrich_active_list(items: list[ReportItem]) -> list[ReportItem]:
+    return _enrich_with_last_logs(_enrich_with_queue_positions(items))
+
+
 @app.get("/api/reports", response_model=ReportsResponse)
 def reports(user: dict = Depends(get_current_user)) -> ReportsResponse:
     rows = list_reports(int(user["id"]), limit=20)
     items = [_normalize_report_row_light(row) for row in rows]
-    return ReportsResponse(reports=_enrich_with_queue_positions(items))
+    return ReportsResponse(reports=_enrich_active_list(items))
 
 
 @app.get("/api/reports/active", response_model=ReportsResponse)
 def reports_active(user: dict = Depends(get_current_user)) -> ReportsResponse:
     rows = list_active_reports(int(user["id"]), limit=20)
     items = [_normalize_report_row_light(row) for row in rows]
-    return ReportsResponse(reports=_enrich_with_queue_positions(items))
+    return ReportsResponse(reports=_enrich_active_list(items))
 
 
 @app.get("/api/reports/{report_id}", response_model=ReportItem)
@@ -2235,12 +2216,45 @@ def remove_report(report_id: str, user: dict = Depends(get_current_user)) -> dic
     if status in {JobStatus.running.value, JobStatus.queued.value, JobStatus.paused.value}:
         raise HTTPException(status_code=400, detail="Нельзя удалить активный отчет. Сначала нажмите Отмена.")
 
-    if not delete_report(report_id, int(user["id"])):
-        raise HTTPException(status_code=404, detail="Отчет не найден")
+    reason = "admin" if access.actor(user)["role"] == "admin" else "user"
+    if not delete_report(report_id, int(user["id"]), deleted_by=int(user["id"]), reason=reason):
+        raise HTTPException(status_code=409, detail="Завершаются запросы обработки отчёта. Повторите удаление позже.")
     return {"status": "deleted"}
 
 
 from app.download_utils import sanitize_download_filename as _sanitize_download_filename
+
+
+def _partial_download(row, fmt, background, filename):
+    from app.partial_exports import get_export
+    # Права уже проверены вызывающим маршрутом. Открываем файл до StreamingResponse:
+    # очистка/новая версия может удалить его имя, но открытый fd останется читаемым.
+    for attempt in range(2):
+        artifact = get_export(str(row['id']), fmt)
+        try:
+            stream = artifact.path.open('rb')
+            break
+        except FileNotFoundError:
+            if attempt: raise HTTPException(409, 'Срез изменился, повторите скачивание')
+    media = 'application/json' if fmt=='json' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    name = _sanitize_download_filename(filename, fallback=artifact.fallback_name(str(row['id'])), extension=fmt)
+    disposition = FileResponse(artifact.path,filename=name).headers['content-disposition']
+    def chunks():
+        try:
+            while data := stream.read(1024*1024): yield data
+        finally: stream.close()
+    background.add_task(stream.close)
+    if artifact.temporary: background.add_task(_delete_path_later,artifact.path)
+    class PartialStreamResponse(StreamingResponse):
+        async def __call__(self,scope,receive,send):
+            try:
+                await super().__call__(scope,receive,send)
+            finally:
+                stream.close()
+                if artifact.temporary: _delete_path_later(artifact.path)
+    return PartialStreamResponse(chunks(),media_type=media,background=background,
+        headers={'Content-Disposition':disposition,'X-Partial-Snapshot':artifact.captured_at,
+                 'Content-Length':str(os.fstat(stream.fileno()).st_size)})
 
 
 def _delete_path_later(path: Path) -> None:
@@ -2250,61 +2264,8 @@ def _delete_path_later(path: Path) -> None:
         logger.warning("Failed to cleanup partial download %s: %s", path, exc)
 
 
-def _build_partial_results_payload(report_id: str, prompt_example: str | None) -> Path:
-    """Собирает временный xlsx из текущего состояния БД для отчёта в running/paused."""
-    summary = get_report_summary_agg(report_id)
-    summary_payload = {
-        "total_rows": int(summary.get("total_rows") or 0),
-        "success_rows": int(summary.get("success_rows") or 0),
-        "failed_rows": int(summary.get("failed_rows") or 0),
-        "partial": True,
-    }
-    report_meta = get_report_any(report_id) or {}
-    group_by_column = (
-        str(report_meta.get("group_by_column") or "").strip() or None
-    )
-
-    def _rows_factory():
-        return iter_report_rows(report_id, batch_size=2000)
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx", dir=str(RESULTS_DIR))
-    tmp.close()
-    path = Path(tmp.name)
-    try:
-        export_results_xlsx(
-            path,
-            _rows_factory,
-            summary_payload,
-            prompt_example=prompt_example,
-            group_by_column=group_by_column,
-        )
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
-    return path
 
 
-def _build_partial_raw_payload(report_id: str, *, provider: str, model: str, prompt_template: str) -> Path:
-    """Собирает временный raw-json из текущего состояния БД для отчёта в running/paused."""
-    def _rows_factory():
-        return iter_report_rows(report_id, batch_size=2000)
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", dir=str(RESULTS_DIR))
-    tmp.close()
-    path = Path(tmp.name)
-    try:
-        export_raw_json(
-            path,
-            rows_factory=_rows_factory,
-            model=model,
-            provider=provider,
-            prompt_template=prompt_template,
-            app_version=APP_VERSION,
-        )
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
-    return path
 
 
 @app.get("/api/reports/{report_id}/download/xlsx")
@@ -2390,15 +2351,7 @@ def download_report_partial_xlsx(
             status_code=409,
             detail="Промежуточная выгрузка доступна только для запущенных или приостановленных отчётов — используйте обычное скачивание",
         )
-    prompt_example = str(row.get("prompt_template") or "") or None
-    tmp_path = _build_partial_results_payload(report_id, prompt_example)
-    background.add_task(_delete_path_later, tmp_path)
-    download_name = _sanitize_download_filename(filename, fallback=f"report_{report_id[:8]}_partial", extension="xlsx")
-    return FileResponse(
-        tmp_path,
-        filename=download_name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    return _partial_download(row, "xlsx", background, filename)
 
 
 @app.get("/api/reports/{report_id}/download/partial/raw")
@@ -2417,22 +2370,7 @@ def download_report_partial_raw(
             status_code=409,
             detail="Промежуточная выгрузка доступна только для запущенных или приостановленных отчётов — используйте обычное скачивание",
         )
-    provider = str(row.get("provider") or "")
-    model = str(row.get("model") or "")
-    prompt_template = str(row.get("prompt_template") or "")
-    tmp_path = _build_partial_raw_payload(
-        report_id,
-        provider=provider,
-        model=model,
-        prompt_template=prompt_template,
-    )
-    background.add_task(_delete_path_later, tmp_path)
-    download_name = _sanitize_download_filename(filename, fallback=f"report_{report_id[:8]}_partial", extension="json")
-    return FileResponse(
-        tmp_path,
-        filename=download_name,
-        media_type="application/json",
-    )
+    return _partial_download(row, "json", background, filename)
 
 
 @app.get("/api/jobs/{job_id}/download/xlsx")
@@ -2467,3 +2405,87 @@ def download_raw(
         raise HTTPException(status_code=404, detail="Сырой файл не найден на диске")
     download_name = _sanitize_download_filename(filename, fallback=path.stem, extension="json")
     return FileResponse(path, filename=download_name, media_type="application/json")
+
+
+def _download_errors(row, background_tasks):
+    report_id = str(row["id"])
+    path = RESULTS_DIR / f"errors_{uuid.uuid4().hex}.xlsx"
+    export_errors_xlsx(path, lambda: iter_report_rows(report_id, errors_only=True))
+    background_tasks.add_task(_delete_path_later, path)
+    return FileResponse(path, filename="errors.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/api/reports/{report_id}/download/errors/xlsx")
+def download_errors(report_id: str, background_tasks: BackgroundTasks, user: dict = Depends(require_access)):
+    row = get_report(report_id, int(user["id"]))
+    if not row:
+        raise HTTPException(404, "Отчёт не найден")
+    return _download_errors(row, background_tasks)
+
+
+@app.get("/api/admin/reports/{report_id}/download/errors/xlsx")
+def admin_download_errors(report_id: str, background_tasks: BackgroundTasks, user: dict = Depends(require_admin)):
+    row = get_report_any(report_id)
+    if not row:
+        raise HTTPException(404, "Отчёт не найден")
+    return _download_errors(row, background_tasks)
+
+
+from app.access_api import router as access_router
+app.include_router(access_router(get_current_user, require_admin, require_access))
+
+
+@app.post("/api/jobs/preview-prompt")
+def preview_prompt(payload: StartJobRequest, user: dict = Depends(require_access)):
+    from app.services.excel_service import iter_sheet_rows
+    from app.services.job_manager import job_manager
+    from app.providers.openai_provider import OpenAIProvider
+    meta = get_uploaded_file(payload.file_id, int(user["id"]))
+    if not meta:
+        raise HTTPException(404, "Загруженный файл не найден")
+    if meta.get("inspect_status") != "ready":
+        raise HTTPException(409, "Дождитесь проверки файла")
+    try:
+        schema = _build_output_schema_from_expected_json_template(payload.expected_json_template or {})
+        non_analysis = list(dict.fromkeys([payload.group_by_column, *(payload.non_analysis_columns or [])])) if payload.group_by_column else payload.non_analysis_columns
+        warnings = settings_warnings(payload.expected_json_template, meta, payload.sheet_name, payload.analysis_columns, non_analysis)
+        if payload.group_by_column and payload.group_by_column not in payload.analysis_columns:
+            raise ValueError("Колонка группировки должна входить в колонки для анализа")
+        rows = iter_sheet_rows(Path(meta["path"]), sheet_name=payload.sheet_name, analysis_columns=payload.analysis_columns,
+                               non_analysis_columns=non_analysis, max_reviews=payload.max_reviews)
+        try:
+            first = next(rows, None)
+            if first is None:
+                raise ValueError("В файле нет строк для анализа")
+            if payload.group_by_column:
+                group_key, _ = job_manager._input_group_key(first, payload.group_by_column)
+                grouped = [first]
+                for row in rows:
+                    if job_manager._input_group_key(row, payload.group_by_column)[0] == group_key:
+                        grouped.append(row)
+                        if len(grouped) > GROUP_MAX_ROWS:
+                            raise ValueError("Первая группа превышает допустимое число строк")
+                first = job_manager._merge_group_rows(grouped, group_key, payload.group_by_column)
+            prompt = job_manager._render_prompt(prompt_template=payload.prompt_template, review_text=first["review_text"],
+                input_json=first["input_json"], analysis_mode=payload.analysis_mode, expected_json_template=payload.expected_json_template,
+                language=payload.prompt_language or get_ui_language())
+        finally:
+            rows.close()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    messages = OpenAIProvider.request_body(prompt, payload.model, payload.temperature)["messages"] if payload.provider == "openai" else [{"role": "user", "content": prompt}]
+    truncated = False
+    shown = []
+    for message in messages:
+        content = str(message.get("content") or "")
+        truncated = truncated or len(content) > 50000
+        shown.append({"role": message.get("role"), "content": content[:50000], "characters": len(content)})
+    return {"messages": shown, "response_schema": schema, "warnings": warnings,
+            "truncated": truncated, "will_send": bool(first.get("review_text")), "tokens_spent": 0}
+
+
+@app.post("/api/reports/bulk_delete")
+def bulk_delete(payload: BulkDeleteRequest, user: dict = Depends(require_access)):
+    from app.db import bulk_delete_reports
+    actor_id = int(user["id"])
+    return bulk_delete_reports(actor_id, payload.ids, admin_actor_id=actor_id if access.actor(user)["role"] == "admin" else None)

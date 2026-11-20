@@ -8,7 +8,6 @@ from pathlib import Path
 
 from app.config import (
     GROUP_MAX_ROWS,
-    REPORT_CLEANUP_ENABLED,
     REPORT_CLEANUP_INTERVAL_SEC,
     REPORT_KEEP_LAST,
     UPLOAD_ORPHAN_TTL_HOURS,
@@ -16,18 +15,21 @@ from app.config import (
 )
 from app.crypto_utils import decrypt_text
 from app.db import (
+    cleanup_legacy_llm_cache_redis_keys,
     cleanup_orphan_uploads_ttl,
     cleanup_reports_keep_last_for_all_users,
     get_report,
     get_uploaded_file,
     list_inflight_reports,
+    release_unused_memory,
     reset_pg_pool,
     update_report_progress,
     update_report_status,
     update_uploaded_file_inspect,
 )
 from app.job_payloads import build_job_payload_from_report
-from app.logging_utils import configure_logging
+from app.logging_utils import (configure_logging, bind_job_context, reset_job_context,
+                               set_request_id, reset_request_id, set_user_context, reset_user_context)
 from app.queue import (
     acquire_lock,
     claim_running_lease,
@@ -47,10 +49,10 @@ try:
 except Exception:  # pragma: no cover
     _PgOperationalError = Exception  # type: ignore[assignment,misc]
 from app.schemas import JobStatus
-from app.services.excel_service import inspect_xlsx
+from app.services.excel_service import inspect_file as inspect_xlsx
 from app.services.job_manager import job_manager
 
-configure_logging("worker")
+configure_logging("inspect-worker" if os.getenv("WORKER_MODE") == "inspect" else "worker")
 logger = logging.getLogger("review_analyzer.worker")
 
 HEARTBEAT_INTERVAL_SEC = max(1, int(os.getenv("WORKER_HEARTBEAT_INTERVAL_SEC", "5")))
@@ -198,6 +200,15 @@ async def _run_payload(payload: dict) -> None:
     if current_status == JobStatus.paused.value:
         return
 
+    if current_status == JobStatus.queued.value:
+        from app.model_catalog import require_enabled
+        from fastapi import HTTPException
+        try:
+            await asyncio.to_thread(require_enabled, report['provider'], report['model'], resume=True)
+        except HTTPException as exc:
+            update_report_status(report_id=report_id, status=JobStatus.paused.value, current_step=str(exc.detail))
+            return
+
     if not claim_running_lease(job_id, RUNNING_LEASE_TTL_SEC):
         # Another worker already holds a lease for this job_id.
         # Treat current payload as duplicate and skip it to avoid requeue storms.
@@ -221,7 +232,8 @@ async def _run_payload(payload: dict) -> None:
     if not isinstance(non_analysis_columns, list):
         non_analysis_columns = []
 
-    file_path = UPLOADS_DIR / f"{payload['file_id']}.xlsx"
+    uploaded = get_uploaded_file(str(payload["file_id"]), user_id)
+    file_path = Path(uploaded["path"]) if uploaded else UPLOADS_DIR / f"{payload['file_id']}.xlsx"
     if not file_path.exists():
         file_path = Path(file_path)
 
@@ -251,6 +263,7 @@ async def _run_payload(payload: dict) -> None:
             provider=str(payload["provider"]),
             model=str(payload["model"]),
             prompt_template=str(payload["prompt_template"]),
+            prompt_language=str(payload.get("prompt_language") or "ru"),
             sheet_name=str(payload["sheet_name"]),
             analysis_columns=[str(item) for item in analysis_columns],
             non_analysis_columns=[str(item) for item in non_analysis_columns],
@@ -265,6 +278,8 @@ async def _run_payload(payload: dict) -> None:
             include_raw_json=bool(payload.get("include_raw_json", True)),
             use_cache=bool(payload.get("use_cache", True)),
             api_key=api_key,
+            access_group_id=report.get("access_group_id"),
+            report_created_at=report["created_at"],
         )
 
         last_heartbeat = 0.0
@@ -274,7 +289,7 @@ async def _run_payload(payload: dict) -> None:
             if desired in {JobStatus.failed.value, JobStatus.completed.value, JobStatus.canceled.value}:
                 if job.status not in {JobStatus.completed, JobStatus.failed, JobStatus.canceled}:
                     logger.info("Worker cancel sync: report_id=%s job_id=%s desired=%s", report_id, job.id, desired)
-                    await job_manager.cancel(job.id)
+                    await job_manager.quiesce(job.id, desired)
                 # Не ждём завершения фоновой _run_job — она могла залипнуть на
                 # долгом LLM-запросе и не дойти до проверки cancel_event. Освобождаем
                 # воркер сразу, иначе новые задачи из очереди не подхватятся.
@@ -290,6 +305,7 @@ async def _run_payload(payload: dict) -> None:
                 # Do not block the whole worker loop on a paused job.
                 # Keep DB status "paused"; resume will enqueue and continue later.
                 logger.info("Worker paused job released: report_id=%s job_id=%s", report_id, job.id)
+                await job_manager.quiesce(job.id, JobStatus.paused.value)
                 break
             elif desired == JobStatus.queued.value and job.status in {JobStatus.running, JobStatus.paused}:
                 update_report_status(report_id=report_id, status=JobStatus.running.value)
@@ -352,13 +368,24 @@ async def _run_file_inspect_payload(payload: dict) -> None:
             file_id,
             user_id,
             inspect_status="error",
-            inspect_error_text=f"Не удалось прочитать xlsx: {exc}",
+                inspect_error_text=f"Не удалось прочитать файл: {exc}",
         )
         logger.warning("File inspect worker failed: file_id=%s user_id=%s error=%s", file_id, user_id, type(exc).__name__)
 
 
 async def main() -> None:
     logger.info("Worker started: mode=%s", WORKER_MODE)
+    async def presence():
+        from app.db import get_redis_client
+        key = 'review_analyzer:presence:' + WORKER_MODE + ':' + os.getenv('HOSTNAME','local')
+        while True:
+            try:
+                client=get_redis_client()
+                if client: await asyncio.to_thread(client.setex,key,20,WORKER_MODE)
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+    asyncio.create_task(presence())
 
     run_analysis = WORKER_MODE in {"analysis", "all", ""}
     run_inspect = WORKER_MODE in {"inspect", "all"}
@@ -368,6 +395,13 @@ async def main() -> None:
         return
 
     if run_analysis:
+        # v2.1.2: одноразовая чистка legacy `llm_cache:*` ключей в Redis,
+        # накопленных до удаления L1-кэша (см. cleanup_legacy_llm_cache_redis_keys).
+        # При следующих стартах SCAN вернёт пусто → no-op.
+        deleted_legacy = await asyncio.to_thread(cleanup_legacy_llm_cache_redis_keys)
+        if deleted_legacy > 0:
+            logger.info("Worker startup: cleaned %s legacy llm_cache:* keys from Redis", deleted_legacy)
+
         requeued, failed = await asyncio.to_thread(_recover_orphaned_reports_once)
         logger.info("Worker recovery pass: requeued=%s failed=%s", requeued, failed)
 
@@ -382,8 +416,15 @@ async def main() -> None:
             await asyncio.sleep(RECOVERY_INTERVAL_SEC)
 
     recovery_task = asyncio.create_task(recovery_loop()) if run_analysis else None
+    async def partial_cleanup_loop():
+        from app.partial_exports import cleanup
+        while True:
+            try: await asyncio.to_thread(cleanup)
+            except Exception: logger.warning('Очистка промежуточных файлов будет повторена')
+            await asyncio.sleep(60)
+    partial_cleanup_task = asyncio.create_task(partial_cleanup_loop()) if run_analysis else None
     cleanup_task = None
-    if run_analysis and REPORT_CLEANUP_ENABLED:
+    if run_analysis and REPORT_CLEANUP_INTERVAL_SEC > 0:
         async def cleanup_loop() -> None:
             while True:
                 try:
@@ -414,44 +455,70 @@ async def main() -> None:
         if not payload:
             await asyncio.sleep(0.2)
             continue
+        from app.db import get_report_any, get_user_by_id
+        report = get_report_any(str(payload.get("report_id") or "")) if payload.get("report_id") else {}
+        owner_id = (report or {}).get("user_id") or payload.get("user_id")
+        owner = get_user_by_id(owner_id) if owner_id else None
+        trace_token = set_request_id((report or {}).get("request_id") or payload.get("request_id") or "-")
+        user_tokens = set_user_context(owner_id, (owner or {}).get("username"))
+        job_token = bind_job_context(report_id=payload.get("report_id"), job_id=payload.get("job_id") or payload.get("file_id"),
+                                     group_id=(report or {}).get("access_group_id"),
+                                     event_type="file.inspect" if payload.get("kind") == "file_inspect" else "job")
         try:
-            await _run_payload(payload)
-        except _PgOperationalError as exc:
-            # BUG-15: разрыв соединения с Postgres (AdminShutdown при рестарте,
-            # network glitch и т.п.). Пул с битыми коннектами непригоден —
-            # сбрасываем, чтобы следующий _get_pg_pool() создал свежий.
-            # Задачу возвращаем в очередь — без этого она навсегда потеряна
-            # (dequeue уже удалил её из Redis-списка).
-            logger.warning(
-                "DB connection lost during worker task, will recover: %s",
-                exc,
-            )
             try:
-                reset_pg_pool()
-            except Exception as reset_exc:  # pragma: no cover - best effort
-                logger.exception("Failed to reset PG pool after OperationalError: %s", reset_exc)
-            kind = "file_inspect" if str(payload.get("kind") or "") == "file_inspect" else "analysis"
-            if not requeue_after_transient_error(payload, kind=kind):
-                logger.error(
-                    "Failed to requeue payload after DB error; task may be lost: kind=%s payload_keys=%s",
-                    kind,
-                    sorted(payload.keys()),
+                await _run_payload(payload)
+            except _PgOperationalError as exc:
+                # BUG-15: разрыв соединения с Postgres (AdminShutdown при рестарте,
+                # network glitch и т.п.). Пул с битыми коннектами непригоден —
+                # сбрасываем, чтобы следующий _get_pg_pool() создал свежий.
+                # Задачу возвращаем в очередь — без этого она навсегда потеряна
+                # (dequeue уже удалил её из Redis-списка).
+                logger.warning(
+                    "DB connection lost during worker task, will recover: %s",
+                    exc,
                 )
-            # Короткая пауза даёт БД прийти в себя прежде чем воркер прочитает
-            # задачу (возможно ту же самую) снова.
-            await asyncio.sleep(1.0)
-        except Exception as exc:
-            logger.exception("Worker task failed: %s", exc)
-            report_id = str(payload.get("report_id") or "")
-            if report_id:
                 try:
-                    update_report_status(report_id=report_id, status=JobStatus.failed.value, error_text=str(exc))
-                except Exception as status_exc:  # pragma: no cover
-                    logger.exception("Failed to mark report failed after task error: %s", status_exc)
+                    reset_pg_pool()
+                except Exception as reset_exc:  # pragma: no cover - best effort
+                    logger.exception("Failed to reset PG pool after OperationalError: %s", reset_exc)
+                kind = "file_inspect" if str(payload.get("kind") or "") == "file_inspect" else "analysis"
+                if not requeue_after_transient_error(payload, kind=kind):
+                    logger.error(
+                        "Failed to requeue payload after DB error; task may be lost: kind=%s payload_keys=%s",
+                        kind,
+                        sorted(payload.keys()),
+                    )
+                # Короткая пауза даёт БД прийти в себя прежде чем воркер прочитает
+                # задачу (возможно ту же самую) снова.
+                await asyncio.sleep(1.0)
+            except Exception as exc:
+                logger.exception("Worker task failed: %s", exc)
+                report_id = str(payload.get("report_id") or "")
+                if report_id:
+                    try:
+                        update_report_status(report_id=report_id, status=JobStatus.failed.value, error_text=str(exc))
+                    except Exception as status_exc:  # pragma: no cover
+                        logger.exception("Failed to mark report failed after task error: %s", status_exc)
+        finally:
+            reset_job_context(job_token)
+            reset_user_context(user_tokens)
+            reset_request_id(trace_token)
+            # BUG-23: после каждой задачи (успех или ошибка) возвращаем
+            # накопленную malloc-фрагментацию ОС. Без этого long-running
+            # Python+glibc раздувается с ~100 МБ до 900+ МБ за неделю и
+            # убивается OOM-killer'ом.
+            try:
+                await asyncio.to_thread(release_unused_memory)
+            except Exception:
+                # release_unused_memory сам обёрнут в try/except — это
+                # дополнительная защита, чтобы не валить main loop.
+                pass
     if recovery_task:
         recovery_task.cancel()
     if cleanup_task:
         cleanup_task.cancel()
+    if partial_cleanup_task:
+        partial_cleanup_task.cancel()
 
 
 if __name__ == "__main__":

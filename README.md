@@ -1,116 +1,91 @@
-# AI Feedback Analyzer
+English · [Русский](README.ru.md)
 
-Self-hosted приложение для массового анализа клиентских отзывов из Excel через LLM. Загружаете `.xlsx`, описываете задачу в промпте, настраиваете поля ответа — сервис прогоняет каждую строку через модель и собирает итоговую xlsx-выгрузку с результатами.
+<h1 align="center"><img src="frontend/public/review-pixel.png" width="32" height="32" alt=""> Analyzer</h1>
 
-Работает с любым OpenAI-совместимым API (OpenAI, Azure OpenAI, локальные инференсы через vLLM/TGI и т. п.) и опционально с Ollama. Модель и провайдер выбираете через `.env`, в UI ключ можно вводить на каждый прогон.
+<p align="center"><strong>Ad hoc spreadsheet analysis with AI.</strong></p>
 
-## Что умеет
+<p align="center">
+  Classify requests, extract attributes from product descriptions, or tag records from an error log. Analyzer runs your plain-language instructions on rows or groups in an XLSX or CSV file and exports the results to Excel.
+</p>
 
-- **Загрузка xlsx, парсинг листов и колонок**, inspect-worker готовит файл в фоне.
-- **Визуальный конструктор полей ответа** — без ручного JSON, типы (текст/число/дата/список), ограничения, enum.
-- **Групповой режим** — LLM получает всю группу строк (например, отзывы одной смены) разом, возвращает один агрегат на группу.
-- **Потоковая обработка** — отчёты на сотни тысяч строк не падают по памяти, xlsx и JSON пишутся на диск по мере поступления.
-- **Live-превью** — первые результаты появляются сразу, пока остальное ещё крутится.
-- **Умный retry** — при невалидном ответе модель получает обратную связь от валидатора и исправляется на следующей попытке.
-- **LLM-кэш** — точный (по хэшу промпта) + семантический (по эмбеддингам), снижает расход токенов при повторных прогонах.
-- **Пауза / продолжение / перезапуск** упавших отчётов без повторного расхода токенов на готовые строки.
-- **Позиция в очереди** — видно сколько задач впереди.
-- **Два готовых пресета** на задачу поиска мошенничества в отзывах сотрудников (построчный и групповой) + демо-файлы в `examples/`.
-- **История отчётов**, изоляция по пользователю, ролевая модель user/admin, админка.
-- **Темы** light/dark.
+<p align="center">
+  <a href="#deploy">Deploy Analyzer</a> · <a href="#run-an-analysis">Run a sample report</a> · <a href="docs/CONFIGURATION.md">Configure .env and replicas</a>
+</p>
 
-## Стек
+![Analyzer workspace with a demo workbook ready for analysis](docs/images/workspace.png)
 
-- **Backend:** FastAPI (Python 3.12), psycopg3 + PostgreSQL 15, Redis 7 (очереди + pubsub + кэш), Argon2, Fernet.
-- **Frontend:** React 18 + TypeScript + MUI v6, Vite.
-- **Инфраструктура:** docker compose (`backend`, `worker`, `inspect-worker`, `frontend`, `postgres`, `redis`).
+## Deploy
 
-## Быстрый старт
+You need Docker with Compose and a model endpoint reachable from the containers. Analyzer supports OpenAI-compatible HTTP APIs and Ollama.
 
-### Требования
-
-- Docker + Docker Compose.
-- Доступ к OpenAI-совместимому LLM (свой API-ключ). Если нет — можно поднять локальный Ollama.
-
-### Запуск
+### 1. Prepare the checkout
 
 ```bash
 git clone https://github.com/MaksimSamarin/ai-feedback-analysis.git
 cd ai-feedback-analysis
 cp .env.example .env
-# Откройте .env и задайте:
-#   OPENAI_BASE_URL   — ваш эндпоинт
-#   OPENAI_API_KEY    — ваш ключ (или оставьте пустым и вводите в UI)
-#   OPENAI_MODELS     — список моделей через запятую (первая = дефолтная)
-#   APP_SECRET        — любая длинная случайная строка (генерация: openssl rand -hex 32)
-#   POSTGRES_PASSWORD — пароль БД
-#   BOOTSTRAP_ADMIN_USERNAME / BOOTSTRAP_ADMIN_PASSWORD — первый админ (опционально)
-
-docker compose up -d --build
 ```
 
-Интерфейс: `http://localhost:8080`
-Health API: `http://localhost:8080/api/health`
+In PowerShell, use `Copy-Item .env.example .env` for the last command.
 
-### Первый анализ
+### 2. Fill in `.env`
 
-1. Войдите (или зарегистрируйтесь).
-2. Блок **«1. Данные и модель»** — перетащите `.xlsx` в зону загрузки или нажмите кнопку **«Примеры файлов»** справа от неё, выберите демо-файл.
-3. Укажите лист, колонки для анализа, опционально колонки для копирования в итоговый отчёт, опционально группировку.
-4. Блок **«2. Шаблон»** — выберите готовый пресет или напишите свой промпт и настройте поля ответа. Подсказка «Как это работает» — по кнопке рядом с заголовком.
-5. Блок **«3. Обработка»** — «Запустить новый анализ».
-6. Блок **«4. Результаты»** — превью обновляется в процессе, готовый xlsx скачивается после завершения.
+Use this command to generate a random value for each secret you configure.
 
-Демо-файлы в `examples/` — две версии на 1 000 и 100 000 отзывов с русскими колонками (`id`, `магазин`, `смена`, `отзыв`, `оценка`, `дата`) и готовыми пресетами под задачу поиска мошенничества.
-
-## Структура проекта
-
-```
-├─ backend/                       # FastAPI + воркеры
-│  ├─ app/
-│  │  ├─ main.py                  # HTTP API, endpoints, auth
-│  │  ├─ db.py                    # PostgreSQL (psycopg3), SQL
-│  │  ├─ worker.py                # analysis / inspect worker
-│  │  ├─ queue.py                 # Redis queues, dedup, lease
-│  │  ├─ services/
-│  │  │  ├─ job_manager.py        # оркестрация обработки, LLM-вызовы
-│  │  │  └─ excel_service.py      # чтение xlsx, потоковый экспорт
-│  │  └─ providers/               # OpenAI-compat, Ollama
-│  └─ tests/unit/                 # pytest, 225+ тестов
-├─ frontend/                      # React + MUI
-├─ ops/postgres/init/             # 001_schema.sql — инициализация БД
-├─ examples/                      # демо-xlsx + генератор
-├─ branding/                      # логотип (замените на свой)
-├─ docs/
-│  ├─ ARCHITECTURE.md
-│  ├─ QUICK_START_RU.md
-│  ├─ RELEASE_NOTES.md
-│  └─ TESTING.md
-├─ docker-compose.yml
-└─ .env.example
+```sh
+docker run --rm python:3.12-slim python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-## Документация
+| Setting | Value |
+| --- | --- |
+| `APP_SECRET` | A long random string used to encrypt saved model API keys. Keep it when upgrading. |
+| `POSTGRES_PASSWORD` | The password for the PostgreSQL account in `POSTGRES_USER`. |
+| `DATABASE_URL` | Analyzer’s database connection string. With the bundled database, use `postgresql://review_analyzer:<postgres-password>@postgres:5432/review_analyzer` and insert the same password as in `POSTGRES_PASSWORD`. |
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — как устроено приложение, поток данных, кэш, масштабирование.
-- [`docs/QUICK_START_RU.md`](docs/QUICK_START_RU.md) — пошаговый гайд на русском.
-- [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md) — история версий.
-- [`docs/TESTING.md`](docs/TESTING.md) — как запускать тесты локально.
+For an **OpenAI-compatible endpoint**, set `OPENAI_BASE_URL` to your endpoint base URL, with or without the trailing `/v1`. Set `OPENAI_MODELS` to its model IDs, separated by commas, and set `OPENAI_API_KEY` to the key. You can also enter the key before running an analysis. For a local endpoint that accepts requests without authentication, use a placeholder such as `local`.
 
-## Запуск тестов
+For **Ollama**, set `OLLAMA_BASE_URL` and `OLLAMA_MODELS`, then select Ollama in Analyzer. On Docker Desktop, a provider running on the host is reachable at an address such as `http://host.docker.internal:11434`.
 
-Локально в Docker (без CI):
+To create the first local administrator, set `BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD` before the first start. Use at least eight characters, including a letter and a digit, for the password.
 
-```bash
-docker compose run --rm --no-deps \
-  -v "$(pwd)/backend/tests:/tests" backend \
-  bash -lc "pip install -q pytest pytest-asyncio && python -m pytest /tests/unit/ -v"
+See the [configuration guide](docs/CONFIGURATION.md) for complete examples and the settings you can tune.
+
+### 3. Start the services
+
+```sh
+docker compose up -d --build --wait
+docker compose ps
 ```
 
-## Лицензия
+Open [Analyzer](http://127.0.0.1:8080/) and check the [API health endpoint](http://127.0.0.1:8080/api/health). If the port is occupied, set `FRONTEND_PORT` in `.env` and open the new port.
 
-MIT — см. [`LICENSE`](LICENSE).
+Start with the six default containers and a 200 GB data disk. The [hardware and scaling guide](docs/CONFIGURATION.md#hardware-and-scaling) gives a starting resource budget and shows how to add a worker when the queue grows.
 
-## Contributing
+## Run an analysis
 
-Issues и PR приветствуются. Для обсуждения крупных изменений сначала заведите issue.
+1. Sign in or create a local account. Under **Data & model**, upload a file or open **Sample files** and choose the smaller demo workbook.
+2. Pick the columns that should go to the model. Use the export column selector for columns to carry through unchanged. Check the sheet and model before continuing.
+3. Under **Template**, choose a preset or write a prompt and add the response fields you want, such as a summary and a sentiment label. Select **Preview model input** to review the prompt, selected data, and response schema.
+4. For the first run, open **Advanced LLM settings** and set **Review limit** to a small number such as 12. Select **Start a new analysis**. Follow progress in **My reports**, open the result, and download the Excel file.
+
+Use a grouping column when several rows describe one unit, such as a store shift. Analyzer sends one request per group and returns one result row per group.
+
+![Completed report with a summary and structured results](docs/images/report.png)
+
+## Administration
+
+- **Language.** English is the default. In **Administration → Settings**, choose English or Russian. This setting controls the interface, built-in prompts, and demo files. Analyzer keeps the language selected for each report when retrying or resuming it. Your prompt and selected source data keep their original language.
+- **Models.** Environment variables seed the model catalog once. Use **Administration → Models** to manage it after the first start.
+- **Access.** Local sign-in and registration are available by default. Administrators can manage groups, quotas, and access requests. An external OIDC provider can connect a directory such as Active Directory. [Sign-in and OIDC setup](docs/AUTHENTICATION.md)
+
+## Upgrade an existing installation
+
+Back up PostgreSQL and the upload and results volumes. Stop the existing services with `docker compose stop`. Keep the Compose project name, volume mappings, database credentials, and `APP_SECRET`, then run the same start command from the updated checkout. Startup applies the schema migration, preserving local passwords and reports from v2.0.0.
+
+## Reference
+
+- [Architecture and data flow](docs/ARCHITECTURE.md)
+- [Development and tests](docs/TESTING.md)
+- [Release notes](docs/RELEASE_NOTES_EN.md)
+- [Custom logo](branding/README.md)
+- [MIT license](LICENSE)

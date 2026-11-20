@@ -1,0 +1,261 @@
+:root {
+  --workspace-bg: #f7f8fb;
+  --workspace-surface: #fff;
+  --workspace-subtle: #f6f8fc;
+  --workspace-border: #dfe4ee;
+  --workspace-text: #202a3a;
+  --workspace-muted: #596579;
+  --workspace-accent: #465c82;
+  --workspace-tint: #edf1f8;
+  --brand-accent: var(--workspace-accent);
+  --brand-accent-dark: #364b71;
+  --brand-accent-soft: var(--workspace-tint);
+  --brand-accent-glow: rgba(70, 92, 130, .15);
+}
+
+html[data-theme="dark"] {
+  --workspace-bg: #171c27;
+  --workspace-surface: #202737;
+  --workspace-subtle: #252e40;
+  --workspace-border: #394457;
+  --workspace-text: #edf1f8;
+  --workspace-muted: #b5c0d3;
+  --workspace-accent: #c2cfe8;
+  --workspace-tint: #303b52;
+  --brand-accent: var(--workspace-accent);
+  --brand-accent-dark: #a7b9de;
+  --brand-accent-soft: var(--workspace-tint);
+  --brand-accent-glow: rgba(194, 207, 232, .15);
+}
+
+.workspace-page, .workspace-login {
+  min-height: 100dvh;
+  color: var(--workspace-text);
+  background: var(--workspace-bg);
+}
+
+.workspace-page::before, .workspace-login::before { display: none; }
+
+.workspace-topbar {
+  border-bottom: 1px solid var(--workspace-border);
+  background: var(--workspace-surface);
+}
+
+.workspace-topbar-inner, .workspace-layout {
+  width: min(100% - 56px, 1104px);
+  margin-inline: auto;
+}
+
+.workspace-topbar-inner {
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.workspace-brand {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.workspace-brand-image {
+  display: block;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+}
+
+.workspace-brand-image[src$="review-pixel.png"] { image-rendering: pixelated; }
+
+.workspace-wordmark.MuiTypography-root {
+  color: var(--workspace-text);
+  font-size: 1rem;
+  font-weight: 690;
+  letter-spacing: -.023em;
+}
+
+.workspace-icon-button.MuiIconButton-root {
+  width: 44px;
+  height: 44px;
+  color: var(--workspace-muted);
+  border: 1px solid var(--workspace-border);
+  border-radius: 10px;
+}
+
+.workspace-icon-button.MuiIconButton-root:hover {
+  color: var(--workspace-text);
+  background: var(--workspace-tint);
+}
+
+.workspace-main {
+  min-width: 0;
+  display: grid;
+  gap: 18px;
+  align-items: start;
+  padding-block: 24px 56px;
+}
+
+.workspace-intro h1 {
+  color: var(--workspace-text);
+  font-size: clamp(1.65rem, 3.2vw, 2.1rem);
+  font-weight: 680;
+  letter-spacing: -.037em;
+  line-height: 1.1;
+}
+
+
+.workspace-nav {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--workspace-border);
+}
+
+.workspace-nav a {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--workspace-muted);
+  text-decoration: none;
+  font-size: .91rem;
+  line-height: 1.25;
+  font-weight: 590;
+}
+
+.workspace-nav a:hover, .workspace-nav a[aria-current] {
+  color: var(--workspace-accent);
+  background: var(--workspace-tint);
+}
+
+.workspace-nav a[aria-current] { font-weight: 680; }
+
+.workspace-nav a[href="#my-reports"] { margin-inline-start: auto; }
+
+.workspace-skip {
+  position: absolute;
+  inset: 8px auto auto 8px;
+  z-index: 5;
+  padding: 10px 14px;
+  color: var(--workspace-text);
+  background: var(--workspace-tint);
+  transform: translateY(-150%);
+}
+
+.workspace-skip:focus { transform: none; }
+
+.workspace-section {
+  min-width: 0;
+  scroll-margin-top: 16px;
+}
+
+.workspace-page .card, .workspace-login .card {
+  min-width: 0;
+  border-color: var(--workspace-border) !important;
+  background: var(--workspace-surface) !important;
+  box-shadow: none !important;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  transform: none;
+  will-change: auto;
+  animation: none;
+}
+
+.workspace-page .card:hover, .workspace-login .card:hover {
+  border-color: var(--workspace-border) !important;
+  box-shadow: none !important;
+}
+
+.workspace-page .card::before, .workspace-login .card::before { display: none; }
+
+.workspace-page .card > .MuiCardContent-root {
+  min-width: 0;
+  padding: clamp(16px, 2.4vw, 24px);
+}
+
+.workspace-file-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.workspace-page .dropzone {
+  min-width: 0;
+  margin-top: 8px;
+  padding: 18px;
+  border: 1px dashed var(--workspace-border);
+  border-radius: 12px;
+  background: var(--workspace-subtle);
+  box-shadow: none;
+}
+
+.workspace-page .dropzone::before { display: none; }
+
+.workspace-page .dropzone.active {
+  border-color: var(--workspace-accent);
+  background: var(--workspace-tint);
+}
+
+.workspace-upload-content {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px 16px;
+}
+
+.workspace-upload-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  color: var(--workspace-accent);
+  background: var(--workspace-tint);
+}
+
+.workspace-upload-copy { overflow-wrap: anywhere; }
+.workspace-upload-label.MuiTypography-root { font-weight: 650; }
+.workspace-choose-file.MuiButton-root { min-height: 44px; }
+
+.workspace-quota {
+  margin-block: 18px 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--workspace-border);
+  outline-offset: 4px;
+}
+
+.workspace-login-content {
+  display: grid;
+  justify-items: center;
+  margin-inline: auto;
+  padding: clamp(32px, 9vh, 92px) 18px 32px;
+  width: min(100%, 450px);
+}
+
+.workspace-login .login-card > .MuiCardContent-root { padding: 26px; }
+
+@media (max-width: 620px) {
+  .workspace-topbar-inner, .workspace-layout { width: calc(100% - 28px); }
+  .workspace-topbar-inner { min-height: 60px; }
+  .workspace-main { gap: 14px; padding-top: 22px; }
+  .workspace-nav a { padding-inline: 9px; }
+  .workspace-nav a[href="#my-reports"] { margin-inline-start: 0; }
+  .workspace-login .login-card > .MuiCardContent-root { padding: 20px; }
+
+  .workspace-upload-content {
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 12px;
+  }
+
+  .workspace-choose-file.MuiButton-root { grid-column: 1 / -1; }
+}

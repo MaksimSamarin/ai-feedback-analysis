@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timezone
@@ -14,6 +15,21 @@ from typing import Any
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 _user_id: contextvars.ContextVar[str] = contextvars.ContextVar("user_id", default="-")
 _username: contextvars.ContextVar[str] = contextvars.ContextVar("username", default="-")
+_job_context = contextvars.ContextVar("job_context", default={})
+_service_name = "backend"
+
+
+def current_context():
+    return {"service": _service_name, "request_id": _request_id.get(), "user_id": _user_id.get(),
+            "username": _username.get(), **_job_context.get()}
+
+
+def bind_job_context(**values):
+    return _job_context.set({**_job_context.get(), **values})
+
+
+def reset_job_context(token):
+    _job_context.reset(token)
 
 _SENSITIVE_PATTERNS = [
     re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s,;]+"),
@@ -24,7 +40,10 @@ _SENSITIVE_PATTERNS = [
 
 
 def set_request_id(value: str) -> contextvars.Token[str]:
-    return _request_id.set(value)
+    safe = str(value)[:128]
+    if _redact(safe) != safe or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", safe):
+        safe = uuid.uuid4().hex
+    return _request_id.set(safe)
 
 
 def reset_request_id(token: contextvars.Token[str]) -> None:
@@ -50,20 +69,20 @@ def _redact(text: str) -> str:
             masked = pattern.sub(r"\1***\2", masked)
         else:
             masked = pattern.sub(r"\1***", masked)
+    masked = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+', r'\1***', masked)
+    masked = re.sub(r'(?i)((?:api[_-]?key|password|secret|token|cookie|authorization)\s*[:=]\s*)[^\s,;]+', r'\1***', masked)
+    masked = re.sub(r'(?is)(["\']?(?:content|prompt|prompt_template|review|отзыв|messages)["\']?\s*[:=]\s*)'
+                    r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|\[[\s\S]*?\]|[^\n]+)', r'\1"***"', masked)
+    for key, value in os.environ.items():
+        if re.search(r'(?i)(api_?key|secret|password|access_token|base_url)', key) and len(value) >= 6:
+            masked = masked.replace(value, "***")
     return masked
 
 
 class JsonFormatter(logging.Formatter):
-    _base_attrs = {
-        "args", "asctime", "created", "exc_info", "exc_text", "filename", "funcName",
-        "levelname", "levelno", "lineno", "module", "msecs", "message", "msg", "name",
-        "pathname", "process", "processName", "relativeCreated", "stack_info", "thread",
-        "threadName",
-    }
-
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": _redact(record.getMessage()),
@@ -71,16 +90,20 @@ class JsonFormatter(logging.Formatter):
             "request_id": getattr(record, "request_id", "-"),
             "user_id": getattr(record, "user_id", "-"),
             "username": getattr(record, "username", "-"),
+            "report_id": getattr(record, "report_id", None),
+            "job_id": getattr(record, "job_id", None),
+            "group_id": getattr(record, "group_id", None),
+            "event_type": getattr(record, "event_type", "application"),
         }
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            payload["exception"] = _redact(self.formatException(record.exc_info))
         for key, value in record.__dict__.items():
-            if key in self._base_attrs or key in payload:
+            if key not in {"status_code", "duration_ms", "row_number", "error_code", "business"} or key in payload:
                 continue
             if value is None:
                 continue
-            payload[key] = value
-        return json.dumps(payload, ensure_ascii=False)
+            payload[key] = _redact(str(value)) if isinstance(value, str) else value
+        return json.dumps({k: _redact(v) if isinstance(v, str) else v for k, v in payload.items()}, ensure_ascii=False)
 
 
 class ContextFilter(logging.Filter):
@@ -90,6 +113,9 @@ class ContextFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.service = self._service
+        for key, value in _job_context.get().items():
+            if not hasattr(record, key):
+                setattr(record, key, value)
         if not getattr(record, "request_id", None) or getattr(record, "request_id", "-") == "-":
             record.request_id = _request_id.get()
         if not getattr(record, "user_id", None) or getattr(record, "user_id", "-") == "-":
@@ -100,6 +126,8 @@ class ContextFilter(logging.Filter):
 
 
 def configure_logging(service: str) -> None:
+    global _service_name
+    _service_name = service
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
@@ -126,6 +154,14 @@ def configure_logging(service: str) -> None:
     handler.setFormatter(JsonFormatter())
     handler.addFilter(ContextFilter(service))
     root.addHandler(handler)
+
+    if os.getenv("STRUCTURED_LOG_DB", "1").lower() in {"1", "true", "yes"}:
+        from app.events import DatabaseHandler
+        database_handler = DatabaseHandler()
+        database_handler.setLevel(level)
+        database_handler.setFormatter(JsonFormatter())
+        database_handler.addFilter(ContextFilter(service))
+        root.addHandler(database_handler)
 
     log_to_file = os.getenv("LOG_TO_FILE", "1").strip().lower() in {"1", "true", "yes"}
     if not log_to_file:

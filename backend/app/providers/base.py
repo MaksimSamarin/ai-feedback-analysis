@@ -13,6 +13,12 @@ class ContextLengthExceeded(Exception):
         super().__init__(provider_message or f"context length exceeded for model {model}")
 
 
+class InvalidLLMResponse(ValueError):
+    def __init__(self, message, raw):
+        super().__init__(message)
+        self.raw = raw
+
+
 class LLMProvider(ABC):
     id: str
 
