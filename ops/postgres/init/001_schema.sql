@@ -1,9 +1,16 @@
 CREATE TABLE IF NOT EXISTS users (
     id BIGSERIAL PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    password_hash TEXT,
+    email TEXT,
+    sso_subject TEXT,
+    sso_provider TEXT,
+    sso_login_name TEXT,
     created_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS users_sso_subject_uidx
+    ON users(sso_provider, sso_subject) WHERE sso_subject IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,

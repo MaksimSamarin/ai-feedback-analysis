@@ -78,6 +78,7 @@ def build_job_payload_from_report(row: dict[str, Any]) -> tuple[dict[str, Any] |
         "provider": provider,
         "model": model,
         "prompt_template": prompt_template,
+        "prompt_language": row.get("prompt_language") or "ru",
         "sheet_name": str(row.get("sheet_name") or ""),
         "analysis_columns": input_columns,
         "non_analysis_columns": non_analysis_columns,

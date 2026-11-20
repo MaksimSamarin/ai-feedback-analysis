@@ -1,41 +1,23 @@
-"""Генератор тестового файла «Мошенничество_N_отзывов.xlsx».
+"""Create deterministic XLSX demo reviews.
 
-100 000 отзывов клиентов по 5 магазинам. Русские имена колонок. Реалистичное
-распределение: 94% обычных отзывов (сервис/брак/позитив/нейтрал), 6% — сознательно
-подмешанные признаки мошенничества сотрудников (для демо и теста).
-
-Магазины отличаются характером:
-- Магазин_Север — «проблемный»: 15% fraud, вымогательство и оплата мимо кассы.
-- Магазин_Запад — 10% fraud: курьеры и подмены товара.
-- Магазин_Центр — 5% fraud: единичные случаи.
-- Магазин_Юг — 0% fraud: сервисные жалобы без признаков мошенничества.
-- Магазин_Онлайн — 0% fraud: технические проблемы (бот, приложение, доставка).
-
-Колонка «смена» — ключ для РАБОЧЕЙ группировки (мелкие группы ~50 отзывов,
-влезают в контекст LLM): «Север_2026-03-15_утро». При группировке по
-«магазин» группы по 20k отзывов гарантированно не влезут в контекст — это
-демонстрация защитной логики сервиса (honest error «Промпт превысил контекст»).
-
-Уникальность: ~50 шаблонов на категорию × случайные подстановки (имена,
-суммы, товары, дни, номера кассы) → десятки тысяч уникальных комбинаций.
-
-Запуск:
-    docker run --rm -v "./examples:/work" -w /work llm-backend python _generate_fraud_sample.py
-
-Параметры:
-    ROWS_TOTAL — сколько строк сгенерировать (default 100_000). Для быстрого
-    локального теста можно запустить с меньшим значением через ENV.
+Run from examples/. Set ROWS_TOTAL to the desired number of rows (default:
+100000). DEMO_LANGUAGE=ru writes the Russian workbook to the current directory.
+DEMO_LANGUAGE=en writes the English workbook to examples/en/.
 """
 from __future__ import annotations
 
 import os
 import random
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from openpyxl import Workbook
 
 SEED = 20260419
 ROWS_TOTAL = int(os.getenv("ROWS_TOTAL", "100000"))
+DEMO_LANGUAGE = os.getenv("DEMO_LANGUAGE", "ru")
+if DEMO_LANGUAGE not in {"en", "ru"}:
+    raise ValueError("DEMO_LANGUAGE must be en or ru")
 
 STORES: list[dict] = [
     {"name": "Магазин_Север", "weight": 0.20, "fraud_rate": 0.15},
@@ -77,7 +59,10 @@ GOODS_NONFOOD = [
 ]
 GOODS_ALL = GOODS_GROCERY + GOODS_NONFOOD
 
-PAYMENT_APPS = ["Тинькофф", "Сбер", "Альфу", "Райф", "ВТБ", "Озон-банк"]
+PAYMENT_DESTINATIONS = [
+    "личную карту", "личный счёт", "номер телефона",
+    "карту продавца", "счёт сотрудника", "личный номер",
+]
 AMOUNTS_SMALL = [350, 480, 690, 820, 1100, 1350, 1580, 1990]
 AMOUNTS_MID = [2100, 2470, 2980, 3200, 3700, 4150, 4800, 5200]
 AMOUNTS_LARGE = [5800, 6400, 7300, 8100, 9200, 10500, 12800, 14400]
@@ -96,12 +81,12 @@ def rnd(choices):
 
 def tpl_fraud_payment_bypass():
     templates = [
-        lambda: f"Кассир {rnd(NAMES_ALL)} предложил не пробивать часть товара и перевести {rnd(AMOUNTS_MID)} рублей на {rnd(PAYMENT_APPS)} ему лично. Отказался, но настаивал.",
+        lambda: f"Кассир {rnd(NAMES_ALL)} предложил не пробивать часть товара и перевести {rnd(AMOUNTS_MID)} рублей на {rnd(PAYMENT_DESTINATIONS)} ему лично. Отказался, но настаивал.",
         lambda: f"На кассе №{rnd(KASSA)} сказали «касса сломана», попросили перевести по номеру телефона — чек отдали рукописный на салфетке.",
         lambda: f"Покупал {rnd(GOODS_NONFOOD)} за {rnd(AMOUNTS_LARGE)}, продавец {rnd(NAMES_ALL)} намекнул что можно оформить без чека со скидкой 20% если скинуть на его карту.",
         lambda: f"Заплатил {rnd(AMOUNTS_MID)} рублей, кассир {rnd(NAMES_ALL)} пробил только половину суммы, предложил остальное положить в конверт — в пользу сотрудников.",
-        lambda: f"Вчера вечером на кассе {rnd(NAMES_ALL)} попросил перевести {rnd(AMOUNTS_SMALL)} сверх чека на {rnd(PAYMENT_APPS)} за «срочное оформление возврата».",
-        lambda: f"Сотрудник {rnd(NAMES_ALL)} сказал, что если оплатить напрямую ему на Сбер — будет скидка 15%, чек распечатывать не будут.",
+        lambda: f"Вчера вечером на кассе {rnd(NAMES_ALL)} попросил перевести {rnd(AMOUNTS_SMALL)} сверх чека на {rnd(PAYMENT_DESTINATIONS)} за «срочное оформление возврата».",
+        lambda: f"Сотрудник {rnd(NAMES_ALL)} сказал, что если оплатить напрямую ему на карту — будет скидка 15%, чек распечатывать не будут.",
         lambda: f"Покупка {rnd(AMOUNTS_LARGE)}, кассир пробил {rnd(AMOUNTS_MID)} и сказал «остальное мне на телефон». Ушла, но ощущение неприятное.",
     ]
     return rnd(templates)()
@@ -141,7 +126,7 @@ def tpl_fraud_return_scam():
     templates = [
         lambda: f"Пришёл на возврат {rnd(GOODS_NONFOOD)} за {rnd(AMOUNTS_LARGE)}, сотрудник {rnd(NAMES_ALL)} оформил «частичный возврат» — деньги пришли меньше, разницу предложил отдать налом «в следующий раз».",
         lambda: f"Заметил что при возврате бланк заполнен карандашом. Кассир {rnd(NAMES_ALL)} сказал «так принято», но цифры потом исправили — вернули меньше заявленного.",
-        lambda: f"Возврат оформили не полностью, обещали разницу отправить СБП — до сих пор ничего не пришло, сотрудник не отвечает.",
+        lambda: f"Возврат оформили не полностью, обещали разницу отправить переводом — до сих пор ничего не пришло, сотрудник не отвечает.",
     ]
     return rnd(templates)()
 
@@ -233,7 +218,7 @@ def tpl_positive():
         lambda: f"Очень понравилось: заказ оформил в три клика, доставили на следующий день, упаковка аккуратная.",
         lambda: f"Консультант {rnd(NAMES_ALL)} помог выбрать {rnd(GOODS_NONFOOD)}, объяснил плюсы-минусы — купил сразу.",
         lambda: f"Возврат оформили без вопросов за 10 минут, деньги пришли через день. Молодцы.",
-        lambda: f"Приложение удобное, Apple Pay работает, бонусы начисляются сразу и их можно тратить.",
+        lambda: f"Приложение удобное, бесконтактная оплата работает, бонусы начисляются сразу и их можно тратить.",
         lambda: f"Отличное качество {rnd(GOODS_GROCERY)}, беру здесь уже третий месяц. Не разочаровывает.",
         lambda: f"Поддержка ответила за минуту, решила проблему сразу — без десятка переадресаций.",
         lambda: f"Продавец {rnd(NAMES_ALL)} не побоялся сказать, что {rnd(GOODS_NONFOOD)} в соседнем магазине дешевле. Честность подкупает.",
@@ -366,8 +351,63 @@ def rating_for_category(cat: str) -> int:
     return 3
 
 
+EN_STORE_NAMES = {
+    "Север": "North",
+    "Центр": "Central",
+    "Юг": "South",
+    "Запад": "West",
+    "Онлайн": "Online",
+}
+EN_REVIEW_TEMPLATES = {
+    "fraud": (
+        "At register {register}, the cashier asked me to transfer {amount} to a personal account for the {item}.",
+        "The employee asked for {amount} in cash to move my order to the front of the queue.",
+        "The salesperson offered a personal discount on the {item} if I paid them directly.",
+        "My refund receipt showed the full amount, but the employee sent me {amount} less than agreed.",
+        "The employee knowingly substituted a refurbished {item} and billed me for a new one.",
+        "The courier asked me to pay the delivery charge into a private account and refused to issue a receipt.",
+    ),
+    "service": (
+        "I waited {minutes} minutes at register {register} before anyone came to help.",
+        "The associate was dismissive when I asked where to find the {item}.",
+        "My pickup order was marked ready, but I waited {minutes} minutes at the counter.",
+        "Support closed my ticket about the {item} before answering the question.",
+        "The checkout area was untidy and register {register} was the only one open.",
+    ),
+    "quality": (
+        "The {item} stopped working on the second day.",
+        "The {item} arrived with a broken part even though the parcel looked intact.",
+        "The {item} did not match the size or colour listed on the website.",
+        "The packaging on the {item} had been opened before I received it.",
+    ),
+    "positive": (
+        "The associate explained the options and helped me choose the right {item}.",
+        "I was in and out of the store in {minutes} minutes. The checkout was easy.",
+        "My {item} was ready for pickup on time and packed carefully.",
+        "The return took only {minutes} minutes. The team made it easy.",
+        "The {item} was exactly as described. I would buy it here again.",
+    ),
+    "neutral": (
+        "The {item} was fine. The experience was about what I expected.",
+        "Delivery was {minutes} minutes late, but the order arrived intact.",
+        "The selection was good, though the {item} cost more than I expected.",
+        "Checkout at register {register} was uneventful.",
+    ),
+}
+
+
+def english_review(category: str) -> str:
+    return rnd(EN_REVIEW_TEMPLATES[category]).format(
+        item=rnd(["headphones", "kettle", "thermos", "desk lamp", "keyboard", "jacket", "charger"]),
+        amount=rnd(["$15", "$28", "$43", "$65", "$92"]),
+        register=rnd(KASSA),
+        minutes=random.randint(5, 65),
+    )
+
+
 def main() -> None:
     random.seed(SEED)
+    english = DEMO_LANGUAGE == "en"
 
     # Адаптивная сетка смен: цель — средняя группа ~40-60 отзывов/смену.
     # При меньших файлах сокращаем период и число слотов, иначе смен больше строк
@@ -412,15 +452,20 @@ def main() -> None:
         for _ in range(quotas[store_name]):
             row_id += 1
             cat, template_fn = category_for_store(store)
-            text = template_fn()
+            text = english_review(cat) if english else template_fn()
             rating = rating_for_category(cat)
             seconds_offset = random.randint(0, total_seconds)
             moment = start + timedelta(seconds=seconds_offset)
             shift = generate_shift_label(store_short, moment, slots_per_day)
+            display_store = EN_STORE_NAMES[store_short] if english else store_name
+            if english:
+                slots = {"утро": "morning", "день": "day", "вечер": "evening", "смена": "shift"}
+                _, shift_date, shift_slot = shift.split("_")
+                shift = f"{display_store}_{shift_date}_{slots[shift_slot]}"
             rows.append(
                 (
                     row_id,
-                    store_name,
+                    display_store,
                     shift,
                     text,
                     rating,
@@ -445,16 +490,22 @@ def main() -> None:
     print("Запись xlsx…")
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Reviews")
-    ws.append(["id", "магазин", "смена", "отзыв", "оценка", "дата"])
+    ws.append(["id", "store", "shift", "review", "rating", "date"] if english
+              else ["id", "магазин", "смена", "отзыв", "оценка", "дата"])
     for row in rows:
         ws.append(row)
 
     # AltSheet для совместимости тестов инспекта (ранее был в маленьком sample).
     alt = wb.create_sheet("AltSheet")
     alt.append(["comment"])
-    alt.append(["Тестовая строка на втором листе"])
+    alt.append(["Sample row on the second worksheet" if english else "Тестовая строка на втором листе"])
 
-    out_name = f"Мошенничество_{ROWS_TOTAL}_отзывов.xlsx"
+    if english:
+        output_dir = Path(__file__).resolve().parent / "en"
+        output_dir.mkdir(exist_ok=True)
+        out_name = output_dir / f"Fraud_{ROWS_TOTAL}_reviews.xlsx"
+    else:
+        out_name = Path(f"Мошенничество_{ROWS_TOTAL}_отзывов.xlsx")
     wb.save(out_name)
     print(f"Сохранено: {out_name}")
 

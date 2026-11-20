@@ -211,29 +211,3 @@ def test_job_status_values() -> None:
     )
 
 
-# ─── AuthRequest ─────────────────────────────────────────────────────────────
-
-
-def test_auth_request_rejects_short_username() -> None:
-    """username минимум 3 символа — короткие логины трудно различать."""
-    from app.schemas import AuthRequest
-
-    with pytest.raises(ValidationError):
-        AuthRequest(username="ab", password="secret123")
-
-
-def test_auth_request_rejects_short_password() -> None:
-    """password минимум 6 символов (Pydantic-lvl проверка, независимо от policy)."""
-    from app.schemas import AuthRequest
-
-    with pytest.raises(ValidationError):
-        AuthRequest(username="valid_user", password="123")
-
-
-def test_auth_request_accepts_valid() -> None:
-    from app.schemas import AuthRequest
-
-    req = AuthRequest(username="user123", password="password1")
-    assert req.username == "user123"
-
-

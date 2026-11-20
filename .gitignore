@@ -12,6 +12,9 @@ backend/results/*
 # Frontend
 frontend/node_modules/
 frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
 
 # Env
 .env
@@ -37,3 +40,7 @@ ops/monitoring/*.log
 
 # Local curl cookie jar
 cookies.txt
+
+# Local logo overrides
+/branding/logo.png
+/branding/logo.svg

@@ -1,63 +1,252 @@
-﻿@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap");
 
+/* =========================================================================
+   Палитра + токены: Light
+   ========================================================================= */
 :root {
-  --brand-accent: #1976d2;
+  --brand-accent: #1565c0;
   --brand-accent-dark: #0d47a1;
-  --ink-900: #151b2b;
+  --brand-accent-soft: rgba(21, 101, 192, 0.08);
+  --brand-accent-glow: rgba(21, 101, 192, 0.32);
+
+  --ink-900: #0f1525;
   --ink-700: #3a4359;
-  --line-200: #dfe3ec;
-  --surface-soft: rgba(255, 255, 255, 0.76);
+  --ink-500: #6b7691;
+  --line-200: rgba(15, 23, 42, 0.08);
+  --line-300: rgba(15, 23, 42, 0.14);
+
+  --surface-soft: rgba(255, 255, 255, 0.72);
   --surface-strong: #ffffff;
-  --hero-fade: radial-gradient(circle at 8% 5%, rgba(25, 118, 210, 0.1) 0%, rgba(25, 118, 210, 0.02) 35%, transparent 70%);
-  --bg-gradient: linear-gradient(180deg, #f8faff 0%, #f4f7fc 100%);
-  --card-shadow: 0 12px 28px rgba(15, 23, 42, 0.09);
-  --dropzone-border: #c9d2e3;
-  --dropzone-bg: rgba(255, 255, 255, 0.85);
-  --dropzone-active-bg: rgba(25, 118, 210, 0.06);
+  --surface-glow: rgba(255, 255, 255, 0.95);
+
+  /* Фоновый градиент страницы */
+  --aurora-1: rgba(21, 101, 192, 0.18);
+  --aurora-2: rgba(99, 102, 241, 0.14);
+  --aurora-3: rgba(34, 197, 94, 0.10);
+
+  --bg-base: #f5f7fc;
+  --bg-gradient: linear-gradient(180deg, #f7f9fd 0%, #eef2f9 100%);
+
+  --card-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.9) inset,
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 12px 32px rgba(15, 23, 42, 0.08);
+  --card-shadow-hover:
+    0 1px 0 rgba(255, 255, 255, 0.9) inset,
+    0 2px 4px rgba(15, 23, 42, 0.06),
+    0 24px 48px rgba(15, 23, 42, 0.14);
+
+  --dropzone-border: rgba(15, 23, 42, 0.16);
+  --dropzone-bg: rgba(255, 255, 255, 0.7);
+  --dropzone-active-bg: rgba(21, 101, 192, 0.06);
+
   --logs-bg: #f9fbff;
-  --logs-border: #dbe3f2;
-  --charts-border: #dde5f3;
+  --logs-border: rgba(15, 23, 42, 0.08);
+  --charts-border: rgba(15, 23, 42, 0.08);
+
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: rgba(15, 23, 42, 0.18);
+  --scrollbar-thumb-hover: rgba(15, 23, 42, 0.32);
+
+  --shimmer: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.65) 50%,
+    transparent 100%
+  );
 }
 
+/* =========================================================================
+   Палитра + токены: Dark
+   ========================================================================= */
 html[data-theme="dark"] {
-  --brand-accent: #64b5f6;
+  --brand-accent: #75baff;
   --brand-accent-dark: #1976d2;
+  --brand-accent-soft: rgba(117, 186, 255, 0.14);
+  --brand-accent-glow: rgba(117, 186, 255, 0.42);
+
   --ink-900: #f2f4f9;
-  --ink-700: #cad2e3;
-  --line-200: #2f3a51;
-  --surface-soft: rgba(23, 29, 46, 0.78);
+  --ink-700: #c0c8db;
+  --ink-500: #8a93ad;
+  --line-200: rgba(255, 255, 255, 0.08);
+  --line-300: rgba(255, 255, 255, 0.14);
+
+  --surface-soft: rgba(23, 29, 46, 0.72);
   --surface-strong: #171d2e;
-  --hero-fade: radial-gradient(circle at 8% 5%, rgba(100, 181, 246, 0.16) 0%, rgba(100, 181, 246, 0.02) 35%, transparent 70%);
-  --bg-gradient: linear-gradient(180deg, #0f1320 0%, #12192b 100%);
-  --card-shadow: 0 16px 36px rgba(0, 0, 0, 0.4);
-  --dropzone-border: #394561;
-  --dropzone-bg: rgba(18, 25, 43, 0.8);
-  --dropzone-active-bg: rgba(100, 181, 246, 0.16);
-  --logs-bg: #11182a;
-  --logs-border: #31405f;
-  --charts-border: #31405f;
+  --surface-glow: rgba(38, 46, 70, 0.95);
+
+  --aurora-1: rgba(117, 186, 255, 0.22);
+  --aurora-2: rgba(99, 102, 241, 0.20);
+  --aurora-3: rgba(34, 197, 94, 0.10);
+
+  --bg-base: #0c1020;
+  --bg-gradient: linear-gradient(180deg, #0c1020 0%, #11172a 100%);
+
+  --card-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 1px 2px rgba(0, 0, 0, 0.4),
+    0 16px 36px rgba(0, 0, 0, 0.45);
+  --card-shadow-hover:
+    0 1px 0 rgba(255, 255, 255, 0.06) inset,
+    0 2px 4px rgba(0, 0, 0, 0.5),
+    0 28px 56px rgba(0, 0, 0, 0.55);
+
+  --dropzone-border: rgba(255, 255, 255, 0.14);
+  --dropzone-bg: rgba(23, 29, 46, 0.6);
+  --dropzone-active-bg: rgba(117, 186, 255, 0.16);
+
+  --logs-bg: #0d1324;
+  --logs-border: rgba(255, 255, 255, 0.06);
+  --charts-border: rgba(255, 255, 255, 0.08);
+
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: rgba(255, 255, 255, 0.14);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.28);
+
+  --shimmer: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.18) 50%,
+    transparent 100%
+  );
 }
 
-* {
+/* =========================================================================
+   Базовые сбросы + плавные переходы темы
+   ========================================================================= */
+*,
+*::before,
+*::after {
   box-sizing: border-box;
 }
 
+html,
+body {
+  background: var(--bg-base);
+  color: var(--ink-900);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "ss01", "cv01", "cv11";
+}
+
+body {
+  transition: background-color 320ms ease, color 320ms ease;
+}
+
+/* Цифры в табличном начертании — никаких прыжков ширины при count-up */
+.MuiTypography-h4,
+.MuiTypography-h5,
+.MuiTypography-h6,
+.MuiTableCell-root,
+.MuiChip-label,
+.MuiLinearProgress-root + .MuiTypography-root {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* Кастомный scrollbar — деликатный, не отвлекает */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background 200ms ease;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+
+/* Глобальный focus-ring — заметный, но не криклый */
+*:focus-visible {
+  outline: 2px solid var(--brand-accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* =========================================================================
+   Page + Aurora-фон (анимированная дымка из 3 радиальных пятен)
+   ========================================================================= */
 .page {
   min-height: 100vh;
   position: relative;
   background: var(--bg-gradient);
   color: var(--ink-900);
+  overflow: hidden;
+  isolation: isolate;
 }
 
 .hero {
-  position: absolute;
-  inset: 0;
-  background: var(--hero-fade);
+  position: fixed;
+  inset: -10% -5% auto -5%;
+  height: 70vh;
+  z-index: 0;
   pointer-events: none;
+  filter: blur(60px) saturate(1.1);
+  opacity: 0.95;
+  background:
+    radial-gradient(circle at 12% 18%, var(--aurora-1) 0%, transparent 42%),
+    radial-gradient(circle at 88% 24%, var(--aurora-2) 0%, transparent 46%),
+    radial-gradient(circle at 50% 78%, var(--aurora-3) 0%, transparent 48%);
+  animation: auroraDrift 28s ease-in-out infinite alternate;
 }
 
+/* Тонкий «шумовой» слой поверх — добавляет премиальную фактуру.
+   Без mix-blend-mode: overlay — он триггерил full-screen recomposite на каждом
+   кадре скролла, из-за чего карточки с backdrop-filter мерцали тёмным. */
+.page::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)' opacity='0.55'/></svg>");
+}
+
+html[data-theme="dark"] .page::before {
+  opacity: 0.045;
+}
+
+@keyframes auroraDrift {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(2%, 1.5%, 0) scale(1.05);
+  }
+  100% {
+    transform: translate3d(-1.5%, 2%, 0) scale(1.02);
+  }
+}
+
+/* Уважаем reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  .hero {
+    animation: none;
+  }
+}
+
+/* =========================================================================
+   Container
+   ========================================================================= */
 .container {
   position: relative;
+  z-index: 1;
   max-width: 1240px;
   margin: 0 auto;
   padding: 26px 16px 38px;
@@ -69,12 +258,43 @@ html[data-theme="dark"] {
 .title {
   font-weight: 800;
   color: var(--ink-900);
+  letter-spacing: -0.025em;
+  background: linear-gradient(135deg, var(--ink-900) 0%, var(--ink-700) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
 .subtitle {
   color: var(--ink-700);
 }
 
+.access-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line-200);
+}
+.access-logo { width: 64px; height: 44px; object-fit: contain; flex-shrink: 0; }
+.access-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+.access-layout > * { min-width: 0; }
+@media (max-width: 899px) {
+  .access-layout { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .access-header { gap: 8px; }
+  .access-logo { width: 40px; height: 36px; }
+  .access-header .MuiTypography-h6 { font-size: 16px; }
+}
+
+/* =========================================================================
+   Бренд + лого с лёгким glow
+   ========================================================================= */
 .brandBox {
   display: flex;
   align-items: center;
@@ -100,8 +320,24 @@ html[data-theme="dark"] {
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
-  box-shadow: none;
+  overflow: visible;
+  position: relative;
+}
+
+.brandLogoFrame::after {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: 24px;
+  background: var(--brand-accent-soft);
+  filter: blur(18px);
+  opacity: 0.7;
+  z-index: -1;
+  transition: opacity 320ms ease;
+}
+
+.brandLogoFrame:hover::after {
+  opacity: 1;
 }
 
 .brandLogo {
@@ -115,12 +351,384 @@ html[data-theme="dark"] {
   border: 0;
   padding: 0;
   display: block;
-  transform: none;
-  transform-origin: center;
   filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.32));
+  transition: transform 320ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
+.brandLogoFrame:hover .brandLogo {
+  transform: scale(1.04);
+}
+
+/* =========================================================================
+   Card — глубокий glassmorphism с inset-highlight + hover lift
+   ========================================================================= */
+.card {
+  background: var(--surface-soft) !important;
+  backdrop-filter: blur(14px) saturate(1.3);
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  border: 1px solid var(--line-200) !important;
+  box-shadow: var(--card-shadow) !important;
+  border-radius: 16px !important;
+  position: relative;
+  overflow: hidden;
+  /* Промоутим карту в GPU-слой — иначе при скролле backdrop-filter
+     не успевает пересчитаться и карта на доли мс рендерится тёмным прямоугольником. */
+  transform: translateZ(0);
+  will-change: transform;
+  transition:
+    transform 280ms cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 280ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 280ms ease;
+  animation: cardFadeIn 480ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Тонкая «световая» полоска поверх карточки — premium glass refraction */
+.card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.6) 50%,
+    transparent 100%
+  );
+  pointer-events: none;
+  opacity: 0.7;
+}
+
+html[data-theme="dark"] .card::before {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.12) 50%,
+    transparent 100%
+  );
+}
+
+.card:hover {
+  border-color: var(--line-300) !important;
+  box-shadow: var(--card-shadow-hover) !important;
+}
+
+@keyframes cardFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Stagger fade-in для нескольких карт подряд */
+.container > .card:nth-of-type(1) { animation-delay: 40ms; }
+.container > .card:nth-of-type(2) { animation-delay: 100ms; }
+.container > .card:nth-of-type(3) { animation-delay: 160ms; }
+.container > .card:nth-of-type(4) { animation-delay: 220ms; }
+.container > .card:nth-of-type(5) { animation-delay: 280ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  .card {
+    animation: none;
+  }
+}
+
+/* =========================================================================
+   Dropzone — пульсирующая подсветка в idle, gradient-border в active
+   ========================================================================= */
+.dropzone {
+  margin-top: 10px;
+  border: 2px dashed var(--dropzone-border);
+  border-radius: 16px;
+  padding: 32px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+  background: var(--dropzone-bg);
+  position: relative;
+  transition:
+    border-color 220ms ease,
+    background 220ms ease,
+    transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.dropzone::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 18px;
+  background: linear-gradient(
+    135deg,
+    var(--brand-accent) 0%,
+    rgba(99, 102, 241, 0.7) 50%,
+    var(--brand-accent) 100%
+  );
+  background-size: 200% 200%;
+  opacity: 0;
+  z-index: -1;
+  transition: opacity 280ms ease;
+  animation: gradientShift 4s ease-in-out infinite;
+}
+
+.dropzone.active {
+  border-color: transparent;
+  background: var(--dropzone-active-bg);
+  transform: scale(1.005);
+}
+
+.dropzone.active::before {
+  opacity: 1;
+}
+
+@keyframes gradientShift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+/* =========================================================================
+   Logs — приглушённый, моноширинный, мягкая граница
+   ========================================================================= */
+.logs {
+  margin-top: 12px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--logs-border);
+  border-radius: 12px;
+  background: var(--logs-bg);
+  padding: 10px 12px;
+}
+
+/* =========================================================================
+   Chart wrap
+   ========================================================================= */
+/* =========================================================================
+   MUI overrides — тонкая шлифовка без правок App.tsx
+   ========================================================================= */
+
+/* LinearProgress: только шейп — высота и скругление.
+   Цвета баров оставлены на дефолтную палитру MUI (color={progressBarColor}). */
+.MuiLinearProgress-root {
+  height: 10px !important;
+  border-radius: 999px !important;
+  overflow: hidden;
+}
+
+.MuiLinearProgress-bar {
+  border-radius: 999px !important;
+}
+
+/* ──────────── Running: акцент на «живом» процессе ────────────
+   Только на чипе с size="small" + filled + warning (это уникальный профиль
+   running-чипа в App.tsx, см. variant={r.status === "running" ? "filled" : "outlined"}). */
+.MuiChip-sizeSmall.MuiChip-colorWarning.MuiChip-filled {
+  animation: chipPulse 2.2s ease-in-out infinite;
+}
+
+@keyframes chipPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(234, 88, 12, 0.45); }
+  50% { box-shadow: 0 0 0 6px rgba(234, 88, 12, 0); }
+}
+
+/* Бар при running (color="warning"): градиент Tailwind orange + shimmer + warm glow.
+   Только для warning, остальные цвета (success/error/info/inherit) — MUI-дефолт. */
+.MuiLinearProgress-colorWarning .MuiLinearProgress-bar {
+  background-image: linear-gradient(90deg, #fb923c 0%, #ea580c 50%, #fb923c 100%);
+  background-size: 200% 100%;
+  animation: progressShimmer 2.4s linear infinite;
+  box-shadow: 0 0 14px rgba(234, 88, 12, 0.42);
+}
+
+@keyframes progressShimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ──────────── Paused: тот же warning-amber, но придержанный ────────────
+   className="lp-paused" в App.tsx — отрубает шиммер/glow и приглушает opacity.
+   Перебивает .MuiLinearProgress-colorWarning через !important. */
+.lp-paused .MuiLinearProgress-bar {
+  background-image: none !important;
+  animation: none !important;
+  box-shadow: none !important;
+  opacity: 0.5;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .MuiChip-sizeSmall.MuiChip-colorWarning.MuiChip-filled,
+  .MuiLinearProgress-colorWarning .MuiLinearProgress-bar {
+    animation: none !important;
+  }
+}
+
+/* TableRow hover — мягкий wash */
+.MuiTableRow-hover:hover {
+  background: rgba(21, 101, 192, 0.04) !important;
+}
+
+html[data-theme="dark"] .MuiTableRow-hover:hover {
+  background: rgba(117, 186, 255, 0.06) !important;
+}
+
+/* Основные кнопки без внешнего свечения во всех состояниях. */
+.MuiButton-contained,
+.MuiButton-contained:hover,
+.MuiButton-contained:active {
+  box-shadow: none !important;
+  transform: none;
+}
+.MuiButton-root:focus-visible {
+  outline: 2px solid var(--ink-700);
+  outline-offset: 3px;
+}
+
+/* Outlined Buttons — мягкий fill при hover */
+.MuiButton-outlined {
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    transform 180ms ease !important;
+}
+
+.MuiButton-outlined:hover {
+  transform: translateY(-1px);
+}
+
+/* Stat-карточки внутри блока «4. Анализ» — h4 цифры с лёгкой gradient-обводкой */
+.MuiCard-outlined {
+  border-radius: 14px !important;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 220ms ease, transform 220ms ease, box-shadow 220ms ease;
+}
+
+.MuiCard-outlined:hover {
+  border-color: var(--line-300) !important;
+  transform: translateY(-2px);
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+}
+
+/* Большие цифры в stat-карточках — анимированный «придых» при ре-рендере */
+.MuiCard-outlined .MuiTypography-h4 {
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  font-variant-numeric: tabular-nums;
+  background: linear-gradient(135deg, var(--ink-900) 0%, var(--ink-700) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Зелёная карта «Успешно обработано» — gradient на цифрах */
+.MuiCard-outlined[style*="success"] .MuiTypography-h4,
+.MuiCard-outlined .MuiTypography-overline.MuiTypography-colorSuccess {
+  /* keep MUI defaults */
+}
+
+/* Accordion — без жирной тени, мягкий border */
+.MuiAccordion-root {
+  background: transparent !important;
+  border: 1px solid var(--line-200);
+  border-radius: 12px !important;
+  overflow: hidden;
+  box-shadow: none !important;
+}
+
+.MuiAccordion-root::before {
+  display: none !important;
+}
+
+.MuiAccordion-root.Mui-expanded {
+  border-color: var(--line-300);
+}
+
+/* Tabs — индикатор более выразительный */
+.MuiTabs-indicator {
+  height: 3px !important;
+  border-radius: 3px 3px 0 0 !important;
+  background: linear-gradient(90deg, var(--brand-accent) 0%, var(--brand-accent-dark) 100%) !important;
+}
+
+.MuiTab-root {
+  text-transform: none !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.01em;
+  transition: color 180ms ease;
+}
+
+/* Inputs — мягкий фокус */
+.MuiOutlinedInput-root {
+  transition: box-shadow 180ms ease !important;
+}
+
+.MuiOutlinedInput-root.Mui-focused {
+  box-shadow: 0 0 0 3px var(--brand-accent-soft);
+}
+
+/* Tooltip — менее «pop-up», более «soft-card» */
+.MuiTooltip-tooltip {
+  background: rgba(15, 21, 37, 0.92) !important;
+  backdrop-filter: blur(8px);
+  border-radius: 8px !important;
+  font-size: 0.78rem !important;
+  padding: 6px 10px !important;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18) !important;
+}
+
+html[data-theme="dark"] .MuiTooltip-tooltip {
+  background: rgba(38, 46, 70, 0.95) !important;
+}
+
+/* Menu/Popover — glass */
+.MuiMenu-paper,
+.MuiPopover-paper {
+  backdrop-filter: blur(18px) saturate(1.4);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+  background: var(--surface-glow) !important;
+  border: 1px solid var(--line-200);
+  border-radius: 12px !important;
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16) !important;
+}
+
+html[data-theme="dark"] .MuiMenu-paper,
+html[data-theme="dark"] .MuiPopover-paper {
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5) !important;
+}
+
+/* Alert — closer to card-style */
+.MuiAlert-root {
+  border-radius: 12px !important;
+  backdrop-filter: blur(8px);
+}
+
+/* Dialog — крупный radius, более глубокая тень */
+.MuiDialog-paper {
+  border-radius: 16px !important;
+  box-shadow: 0 28px 64px rgba(15, 23, 42, 0.25) !important;
+}
+
+html[data-theme="dark"] .MuiDialog-paper {
+  box-shadow: 0 32px 72px rgba(0, 0, 0, 0.6) !important;
+}
+
+/* =========================================================================
+   Адаптив
+   ========================================================================= */
 @media (max-width: 768px) {
+  .container {
+    padding: 18px 10px 26px;
+  }
+
+  .dropzone {
+    padding: 20px;
+  }
+
   .brandBox {
     gap: 12px;
   }
@@ -129,70 +737,410 @@ html[data-theme="dark"] {
     width: 108px;
     height: 44px;
     min-width: 108px;
-    border-radius: 0;
   }
 
   .brandLogo {
     transform: scale(1.05);
   }
+
+  .hero {
+    height: 50vh;
+    filter: blur(40px) saturate(1.05);
+  }
 }
 
-.card {
-  background: var(--surface-soft);
-  backdrop-filter: blur(8px);
+/* =========================================================================
+   Утилитарные классы (на случай адресной правки в App.tsx позже)
+   ========================================================================= */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* =============================================================================
+   STAGE 2: Hero-progress (SVG ring + meta), Logs feed, Stat-cards, Aurora-active
+   ============================================================================= */
+
+/* ──────────── Aurora intensifies when there's an active report ──────────── */
+.page.is-active .hero {
+  animation-duration: 14s;
+  filter: blur(58px) saturate(1.2);
+}
+
+/* ──────────── Hero processing card ──────────── */
+.hero-progress {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 28px;
+  align-items: center;
+  padding: 22px 26px;
+  border-radius: 18px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.5) 0%, rgba(255, 255, 255, 0.18) 100%);
+  backdrop-filter: blur(12px) saturate(1.2);
+  -webkit-backdrop-filter: blur(12px) saturate(1.2);
   border: 1px solid var(--line-200);
-  box-shadow: var(--card-shadow);
+  position: relative;
+  overflow: hidden;
+  transform: translateZ(0);
+  will-change: transform;
 }
 
-.dropzone {
-  margin-top: 10px;
-  border: 2px dashed var(--dropzone-border);
-  border-radius: 14px;
-  padding: 30px;
+html[data-theme="dark"] .hero-progress {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.02) 100%);
+}
+
+/* Тонкая «световая полоска» сверху hero-карточки — premium glass refraction */
+.hero-progress::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.55), transparent);
+  pointer-events: none;
+}
+
+html[data-theme="dark"] .hero-progress::before {
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.12), transparent);
+}
+
+/* Цветной градиентный «glow» в углу hero — настраивается под статус */
+.hero-progress::after {
+  content: "";
+  position: absolute;
+  width: 280px;
+  height: 280px;
+  right: -100px;
+  top: -100px;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.6;
+  pointer-events: none;
+  z-index: 0;
+  transition: background 600ms ease, opacity 400ms ease;
+}
+
+.hero-progress-running::after { background: radial-gradient(circle, #fb923c 0%, transparent 70%); }
+.hero-progress-paused::after  { background: radial-gradient(circle, #fb923c 0%, transparent 70%); opacity: 0.25; }
+.hero-progress-completed::after { background: radial-gradient(circle, #34d399 0%, transparent 70%); }
+.hero-progress-failed::after  { background: radial-gradient(circle, #f87171 0%, transparent 70%); }
+.hero-progress-queued::after  { background: radial-gradient(circle, #60a5fa 0%, transparent 70%); }
+.hero-progress-canceled::after,
+.hero-progress-empty::after  { background: radial-gradient(circle, var(--ink-500) 0%, transparent 70%); opacity: 0.18; }
+
+.hero-progress > * {
+  position: relative;
+  z-index: 1;
+}
+
+@media (max-width: 720px) {
+  .hero-progress {
+    grid-template-columns: 1fr;
+    text-align: center;
+    padding: 20px;
+    gap: 16px;
+  }
+  .hero-progress .ring-progress {
+    margin: 0 auto;
+  }
+  .hero-progress-meta {
+    align-items: center;
+  }
+  .hero-progress-meta .meta-numbers {
+    justify-content: center;
+  }
+}
+
+/* ──────────── Ring progress SVG ──────────── */
+.ring-progress {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
   justify-content: center;
+}
+
+.ring-progress .ring-track {
+  stroke: var(--line-200);
+  opacity: 0.55;
+}
+
+html[data-theme="dark"] .ring-progress .ring-track {
+  stroke: rgba(255, 255, 255, 0.08);
+}
+
+.ring-progress .ring-fill {
+  transition: stroke-dashoffset 600ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.ring-status-running .ring-fill {
+  filter: drop-shadow(0 0 14px rgba(234, 88, 12, 0.5));
+  animation: ringHaloPulse 2.4s ease-in-out infinite;
+}
+
+@keyframes ringHaloPulse {
+  0%, 100% { filter: drop-shadow(0 0 12px rgba(234, 88, 12, 0.45)); }
+  50%      { filter: drop-shadow(0 0 22px rgba(234, 88, 12, 0.7)); }
+}
+
+.ring-status-paused .ring-fill {
+  opacity: 0.55;
+  filter: none;
+}
+
+.ring-status-completed .ring-fill {
+  filter: drop-shadow(0 0 14px rgba(16, 185, 129, 0.45));
+}
+
+.ring-status-failed .ring-fill {
+  filter: drop-shadow(0 0 12px rgba(220, 38, 38, 0.4));
+}
+
+.ring-status-queued .ring-fill {
+  filter: drop-shadow(0 0 12px rgba(37, 99, 235, 0.35));
+  opacity: 0.7;
+}
+
+.ring-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  text-align: center;
+}
+
+.ring-main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.ring-percent {
+  font-size: 1.85rem;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  background: linear-gradient(135deg, var(--ink-900) 0%, var(--ink-700) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.ring-percent-done { color: #10b981; -webkit-text-fill-color: #10b981; }
+.ring-percent-fail { color: #dc2626; -webkit-text-fill-color: #dc2626; font-size: 2.4rem; }
+.ring-percent-queue { color: var(--ink-500); -webkit-text-fill-color: var(--ink-500); }
+
+html[data-theme="dark"] .ring-percent-done { -webkit-text-fill-color: #34d399; }
+html[data-theme="dark"] .ring-percent-fail { -webkit-text-fill-color: #f87171; }
+
+.ring-sub {
+  margin-top: 6px;
+  font-size: 0.7rem;
+  color: var(--ink-500);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+
+/* ──────────── Hero meta column ──────────── */
+.hero-progress-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.meta-numbers {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
   flex-wrap: wrap;
-  transition: all 0.2s ease;
-  background: var(--dropzone-bg);
 }
 
-.dropzone.active {
-  border-color: var(--brand-accent);
-  background: var(--dropzone-active-bg);
+.num-current {
+  font-size: 2.1rem;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  line-height: 1;
+  background: linear-gradient(135deg, var(--ink-900) 0%, var(--ink-700) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
-.logs {
-  margin-top: 12px;
-  max-height: 180px;
-  overflow: auto;
-  border: 1px solid var(--logs-border);
-  border-radius: 10px;
+.num-divider {
+  font-size: 1.4rem;
+  color: var(--ink-500);
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.num-total {
+  font-size: 1.4rem;
+  color: var(--ink-700);
+  font-weight: 600;
+}
+
+.meta-unit {
+  font-size: 0.78rem;
+  color: var(--ink-500);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 600;
+  margin-left: 4px;
+}
+
+.meta-eta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--brand-accent-soft);
+  color: var(--brand-accent);
+  font-size: 0.78rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  width: fit-content;
+}
+
+.meta-eta .live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+  animation: liveDot 1.4s ease-in-out infinite;
+}
+
+@keyframes liveDot {
+  0%, 100% { opacity: 0.55; transform: scale(0.92); }
+  50%      { opacity: 1;    transform: scale(1.08); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ring-status-running .ring-fill,
+  .meta-eta .live-dot {
+    animation: none !important;
+  }
+}
+
+/* ──────────── Logs feed: цветные полоски и slide-in ──────────── */
+.logs-feed {
+  margin-top: 16px;
+  max-height: 220px;
+  overflow-y: auto;
+  border-radius: 12px;
   background: var(--logs-bg);
-  padding: 10px;
+  border: 1px solid var(--logs-border);
+  padding: 8px 0;
+  font-family: "IBM Plex Mono", "Consolas", "Courier New", monospace;
+  font-size: 0.74rem;
+  line-height: 1.55;
+  scroll-behavior: smooth;
 }
 
-.logline {
-  font-family: "IBM Plex Mono", "Consolas", monospace;
-  font-size: 0.84rem;
+.logs-feed .log-line {
+  display: grid;
+  grid-template-columns: 4px 1fr;
+  gap: 12px;
+  padding: 4px 14px;
+  align-items: stretch;
+  animation: logSlideIn 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
-.chartWrap {
-  flex: 1;
-  min-width: 260px;
-  border: 1px solid var(--charts-border);
-  border-radius: 10px;
-  padding: 8px;
-  background: var(--surface-strong);
+.logs-feed .log-line .log-stripe {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--ink-500);
+  opacity: 0.35;
+  align-self: stretch;
 }
 
-@media (max-width: 768px) {
-  .container {
-    padding: 18px 10px 26px;
+.logs-feed .log-info    .log-stripe { background: #3b82f6; opacity: 0.75; }
+.logs-feed .log-warn    .log-stripe { background: #ea580c; opacity: 0.85; }
+.logs-feed .log-error   .log-stripe { background: #dc2626; opacity: 0.95; box-shadow: 0 0 6px rgba(220, 38, 38, 0.5); }
+.logs-feed .log-debug   .log-stripe { background: var(--ink-500); opacity: 0.25; }
+
+.logs-feed .log-text {
+  color: var(--ink-700);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.logs-feed .log-error .log-text {
+  color: var(--ink-900);
+  font-weight: 500;
+}
+
+.logs-feed .log-warn .log-text {
+  color: var(--ink-900);
+}
+
+@keyframes logSlideIn {
+  from { opacity: 0; transform: translateX(-10px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .logs-feed .log-line {
+    animation: none;
   }
+}
 
-  .dropzone {
-    padding: 18px;
-  }
+/* ──────────── Stat cards в «4. Анализ»: цветной accent-strip + premium look ──────────── */
+.stat-card {
+  position: relative;
+  border-radius: 14px !important;
+  overflow: hidden;
+  transition: transform 220ms ease, box-shadow 220ms ease, border-color 220ms ease;
+}
+
+.stat-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--ink-500);
+  opacity: 0.4;
+  transition: background 240ms ease, opacity 240ms ease;
+}
+
+.stat-card-success::before { background: linear-gradient(180deg, #34d399 0%, #10b981 100%); opacity: 1; }
+.stat-card-error::before   { background: linear-gradient(180deg, #f87171 0%, #dc2626 100%); opacity: 1; }
+/* Нейтральный цвет для действий без собственного статуса.
+   «Всего групп» с красной полоской читалось как ошибка. Нейтральный slate
+   подчёркивает «это просто счётчик, не статус». */
+.stat-card-neutral::before { background: linear-gradient(180deg, #94a3b8 0%, #64748b 100%); opacity: 0.6; }
+html[data-theme="dark"] .stat-card-neutral::before { background: linear-gradient(180deg, #64748b 0%, #475569 100%); opacity: 0.7; }
+
+.stat-card .MuiTypography-h4 {
+  margin-top: 4px;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-card .MuiTypography-overline {
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  font-weight: 700;
+}
+
+.stat-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 16px 32px rgba(15, 23, 42, 0.10);
+}
+
+html[data-theme="dark"] .stat-card:hover {
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
 }

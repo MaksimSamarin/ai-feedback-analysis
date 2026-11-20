@@ -113,27 +113,33 @@ def test_export_results_xlsx_streams_without_materializing_rows(tmp_path: Path) 
         wb.close()
 
 
-def test_export_results_xlsx_uses_write_only_mode(tmp_path: Path) -> None:
-    """Регрессия: экспорт должен использовать Workbook(write_only=True).
+def test_export_results_xlsx_uses_constant_memory_mode(tmp_path: Path) -> None:
+    """Регрессия BUG-14: экспорт должен использовать xlsxwriter с constant_memory=True.
 
-    Workbook без write_only держит все строки в памяти до save() — на больших отчётах это
-    приводило к OOM-kill (BUG-14). Проверяем через инстроспекцию: у write-only книги
-    нет активного листа (`wb.active is None`), и приходится создавать через `create_sheet`.
+    Без constant_memory xlsxwriter держит все строки в памяти до wb.close() — на больших
+    отчётах это приводило к OOM-kill. Проверяем через инстроспекцию: ловим вызов
+    xlsxwriter.Workbook и убеждаемся что в options передан {"constant_memory": True}.
+
+    Раньше (до миграции на xlsxwriter) тут проверялся openpyxl Workbook(write_only=True).
     """
-    import openpyxl
+    import xlsxwriter
 
-    original_workbook = openpyxl.Workbook
-    observed_kwargs: list[dict[str, Any]] = []
+    original_workbook = xlsxwriter.Workbook
+    observed_options: list[Any] = []
 
     def tracking_workbook(*args: Any, **kwargs: Any) -> Any:
-        observed_kwargs.append(kwargs)
+        # xlsxwriter.Workbook(filename_or_buf, options_dict)
+        if len(args) >= 2:
+            observed_options.append(args[1])
+        elif "options" in kwargs:
+            observed_options.append(kwargs["options"])
+        else:
+            observed_options.append({})
         return original_workbook(*args, **kwargs)
 
-    monkey_target = "app.services.excel_service.Workbook"
-    # Патчим через monkeypatch напрямую — чтобы не зависеть от fixture.
     import app.services.excel_service as mod
 
-    mod.Workbook = tracking_workbook  # type: ignore[assignment]
+    mod.xlsxwriter.Workbook = tracking_workbook  # type: ignore[assignment]
     try:
         def factory() -> Iterator[dict[str, Any]]:
             yield _make_row(1)
@@ -144,12 +150,11 @@ def test_export_results_xlsx_uses_write_only_mode(tmp_path: Path) -> None:
             summary={"total_rows": 1},
         )
     finally:
-        mod.Workbook = original_workbook  # type: ignore[assignment]
+        mod.xlsxwriter.Workbook = original_workbook  # type: ignore[assignment]
 
-    assert observed_kwargs, "Workbook не был вызван"
-    # Хотя бы один вызов должен быть с write_only=True (основной экспорт)
-    assert any(kw.get("write_only") is True for kw in observed_kwargs), (
-        f"Workbook должен инстанцироваться с write_only=True, kwargs={observed_kwargs}"
+    assert observed_options, "xlsxwriter.Workbook не был вызван"
+    assert any(opt.get("constant_memory") is True for opt in observed_options), (
+        f"Workbook должен создаваться с constant_memory=True, options={observed_options}"
     )
 
 
@@ -302,7 +307,12 @@ def test_export_results_xlsx_memory_stays_bounded_on_large_report(tmp_path: Path
     200–400 МБ на такой объём, стриминг укладывается в ≪100 МБ прироста RSS.
     """
     import gc
-    import psutil
+
+    psutil = pytest.importorskip(
+        "psutil",
+        reason="psutil — dev-зависимость (requirements-dev.txt), в prod-образе не ставится; "
+        "тест на нагрузочный замер RSS можно запустить только в dev-окружении",
+    )
 
     total_rows = 200_000
 

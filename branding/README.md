@@ -1,17 +1,11 @@
-﻿# Branding
+# Custom logo
 
-Как работает логотип:
+Place `logo.png` or `logo.svg` in this directory as a local override. Analyzer uses the PNG first, then the SVG, then its built-in pixel logo.
 
-- `branding/logo.png` - логотип проекта (приоритет 1).
-- `branding/logo.svg` - резервный SVG-логотип (приоритет 2).
-- `frontend/public/logo-default.svg` - дефолтный логотип из репозитория.
+Compose mounts this directory in the frontend as read-only. Reload the page to see the new logo.
 
-Логика в UI:
-- сначала пробует `/branding/logo.png`;
-- если его нет - пробует `/branding/logo.svg`;
-- если его нет - пробует `/branding/logo-default.png`;
-- если файла нет, автоматически показывает дефолтный `/logo-default.svg`.
+To change the tab icon, replace `frontend/public/review-pixel.png` and rebuild the frontend.
 
-Как обновить логотип:
-1. Замените `branding/logo.svg` и/или `branding/logo.png`.
-2. Перезапустите frontend: `docker compose up -d --build frontend`.
+```sh
+docker compose up -d --build frontend
+```

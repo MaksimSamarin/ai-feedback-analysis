@@ -17,6 +17,10 @@
 
 from __future__ import annotations
 
+import re
+
+import pytest
+
 
 def _make_manager():
     from app.services.job_manager import JobManager
@@ -105,3 +109,32 @@ def test_feedback_mentions_what_model_should_do() -> None:
     prompt = _render(retry_feedback=feedback)
     assert "EXPECTED_JSON" in prompt  # есть упоминание схемы
     assert "без повторения ошибок" in prompt or "Исправь" in prompt or "Верни корректный" in prompt
+
+
+def test_english_prompt_contains_english_retry_feedback() -> None:
+    manager = _make_manager()
+    schema = {"type": "object", "required": ["summary"]}
+    with pytest.raises(ValueError, match="Required field missing: summary") as error:
+        manager._validate_custom_output({}, schema, language="en")
+    prompt = _render(
+        language="en",
+        prompt_template="Summarize the review in English.",
+        input_json='{"review": "Delivery arrived late."}',
+        expected_json_template={"summary": {"type": "string"}},
+        retry_feedback={"error": str(error.value), "previous_response": {}},
+    )
+    assert "Input row:" in prompt and "EXPECTED_JSON:" in prompt
+    assert "Validation error: Required field missing: summary" in prompt
+    assert not re.search(r"[А-Яа-яЁё]", prompt)
+
+
+def test_prompt_language_partitions_exact_and_semantic_caches() -> None:
+    manager = _make_manager()
+    params = dict(
+        provider_id="openai", model="demo", analysis_mode="custom", prompt_template="Summarize.",
+        expected_json_template=None, output_schema=None, normalized_review="Delivery arrived late.",
+    )
+    russian = manager._compute_cache_key(**params, language="ru")
+    english = manager._compute_cache_key(**params, language="en")
+    assert russian == manager._compute_cache_key(**params)
+    assert russian[0] != english[0] and russian[1] != english[1]

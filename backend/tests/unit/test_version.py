@@ -58,3 +58,8 @@ def test_version_is_2_x() -> None:
     assert major >= 2, (
         f"ожидали major >= 2 для release 2.0+, получили __version__={__version__!r}"
     )
+
+
+def test_current_release_version() -> None:
+    from app import __version__
+    assert __version__ == "2.2.0"

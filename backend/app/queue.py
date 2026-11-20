@@ -22,6 +22,25 @@ def _queued_marker_key(queue_key: str, dedup_id: str) -> str:
     return f"{queue_key}:queued:{dedup_id}"
 
 
+def clear_job_dedup_marker(job_id: str) -> None:
+    """Снимает dedup-маркер для job_id без удаления из очереди.
+
+    В норме маркер снимается воркером при dequeue или endpoint'ом cancel.
+    Этот хелпер нужен в /retry на случай краш-сценария: воркер упал между
+    dequeue и delete → маркер остался висеть как сирота и блокирует
+    enqueue до истечения JOB_QUEUE_DEDUP_TTL_SEC (неделя). Принудительный
+    delete перед enqueue в /retry гарантирует что повторная постановка
+    задачи в очередь не упрётся в висячий маркер.
+    """
+    clean = str(job_id or "").strip()
+    if not clean:
+        return
+    try:
+        _redis().delete(_queued_marker_key(QUEUE_KEY, clean))
+    except Exception:
+        pass
+
+
 def _running_lease_key(job_id: str) -> str:
     return f"{QUEUE_KEY}:running:{job_id}"
 
@@ -42,6 +61,8 @@ def _redis() -> Redis:
 
 
 def enqueue_job(payload: dict[str, Any]) -> bool:
+    from app.logging_utils import current_context
+    payload = {"request_id": current_context()["request_id"], **payload}
     client = _redis()
     job_id = str(payload.get("job_id") or "").strip()
     if job_id:
@@ -53,6 +74,8 @@ def enqueue_job(payload: dict[str, Any]) -> bool:
 
 
 def enqueue_inspect_job(payload: dict[str, Any]) -> bool:
+    from app.logging_utils import current_context
+    payload = {"request_id": current_context()["request_id"], **payload}
     client = _redis()
     dedup_id = str(payload.get("file_id") or payload.get("job_id") or "").strip()
     if dedup_id:

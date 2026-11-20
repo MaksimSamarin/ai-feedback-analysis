@@ -1,10 +1,9 @@
+import { getUiLanguage, uiText, type UILanguage } from "./i18n";
 import type {
-  AdminLogItem,
   AdminStats,
-  AdminUserItem,
+  AuthConfig,
   AuthResponse,
   FileInspectResponse,
-  JobState,
   Provider,
   ReportAnalysis,
   ReportItem,
@@ -47,26 +46,61 @@ function normalizeErrorDetail(detail: unknown): string {
       .filter(Boolean);
     return parts.join("; ");
   }
-  if (typeof detail === "object") return JSON.stringify(detail);
+  if (typeof detail === "object") {
+    const message = (detail as Record<string, unknown>).message;
+    return typeof message === "string" ? message : JSON.stringify(detail);
+  }
   return String(detail);
+}
+
+export class APIError extends Error {
+  constructor(message: string, public status: number, public detail: Record<string, unknown> | null) { super(uiText(message)); }
 }
 
 async function handle<T>(response: Response): Promise<T> {
   if (!response.ok) {
+    if (response.status === 413) throw new APIError(
+      uiText("Файл превышает допустимый размер загрузки. Уменьшите файл; стандартный лимит — 200 МБ."), 413, null,
+    );
     let msg = `${response.status} ${response.statusText}`;
+    let detail: Record<string, unknown> | null = null;
     try {
       const body = await response.json();
       msg = normalizeErrorDetail(body.detail) || msg;
+      if (body.detail && typeof body.detail === "object") detail = body.detail;
     } catch {
       // ignore
     }
-    throw new Error(msg);
+    throw new APIError(msg, response.status, detail);
   }
   return response.json() as Promise<T>;
 }
 
 export const api = {
   base: API_BASE,
+
+  async getUiSettings(): Promise<{ language: UILanguage }> {
+    const response = await fetch(apiUrl("/ui/settings"), { cache: "no-store", signal: AbortSignal.timeout(3000) });
+    const { language } = await handle<{ language: unknown }>(response);
+    return { language: language === "ru" ? "ru" : "en" };
+  },
+
+  async saveUiSettings(language: UILanguage): Promise<void> {
+    await handle(await fetch(apiUrl("/admin/settings"), withCreds({
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ language }),
+    })));
+  },
+
+  async getUserRules(): Promise<{ content_md: string }> {
+    return handle(await fetch(apiUrl(`/access/rules?language=${getUiLanguage()}`), withCreds()));
+  },
+
+  async bulkDeleteReports(ids: string[]): Promise<{ results: Array<{ id: string; status: string; message?: string }>; deleted: number; failed: number }> {
+    return handle(await fetch(apiUrl("/reports/bulk_delete"), withCreds({ method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) })));
+  },
 
   async getDefaultPrompt(): Promise<{ promptTemplate: string; parallelismMax: number }> {
     const data = await handle<{ prompt_template: string; parallelism_max?: number }>(
@@ -83,9 +117,9 @@ export const api = {
     return data.providers;
   },
 
-  async getModels(provider: string): Promise<string[]> {
-    const data = await handle<{ models: string[] }>(await fetch(apiUrl(`/models?provider=${provider}`), withCreds()));
-    return data.models;
+  async getModels(provider: string): Promise<import("./modelChoice").ModelChoice[]> {
+    const data = await handle<{ entries: import("./modelChoice").ModelChoice[] }>(await fetch(apiUrl(`/models?provider=${provider}`), withCreds()));
+    return data.entries;
   },
 
   async verifyProviderToken(provider: string, apiKey: string | null): Promise<VerifyTokenResult> {
@@ -114,7 +148,7 @@ export const api = {
       await fetch(apiUrl("/jobs"), withCreds({
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, prompt_language: getUiLanguage() }),
       })),
     );
     return data.job_id;
@@ -134,14 +168,6 @@ export const api = {
 
   async retryJob(jobId: string): Promise<void> {
     await handle(await fetch(apiUrl(`/jobs/${jobId}/retry`), withCreds({ method: "POST" })));
-  },
-
-  async getJob(jobId: string): Promise<JobState> {
-    return handle<JobState>(await fetch(apiUrl(`/jobs/${jobId}`), withCreds()));
-  },
-
-  jobEventsUrl(jobId: string): string {
-    return apiUrl(`/jobs/${jobId}/events`);
   },
 
   async register(username: string, password: string): Promise<AuthResponse> {
@@ -164,24 +190,20 @@ export const api = {
     );
   },
 
+  async getAuthConfig(): Promise<AuthConfig> {
+    return handle<AuthConfig>(await fetch(apiUrl("/auth/config"), withCreds()));
+  },
+
+  ssoLoginUrl(force = false): string {
+    return apiUrl(force ? "/auth/sso/login?force=1" : "/auth/sso/login");
+  },
+
   async me(): Promise<User> {
     return handle<User>(await fetch(apiUrl("/auth/me"), withCreds()));
   },
 
   async usage(): Promise<Usage> {
     return handle<Usage>(await fetch(apiUrl("/auth/usage"), withCreds()));
-  },
-
-  async adminUsers(): Promise<AdminUserItem[]> {
-    const data = await handle<{ users: AdminUserItem[] }>(await fetch(apiUrl("/admin/users"), withCreds()));
-    return data.users;
-  },
-
-  async adminUserReports(userId: number, limit = 50): Promise<ReportItem[]> {
-    const data = await handle<{ reports: ReportItem[] }>(
-      await fetch(apiUrl(`/admin/users/${userId}/reports?limit=${limit}`), withCreds()),
-    );
-    return data.reports;
   },
 
   async adminReportAnalysis(reportId: string): Promise<ReportAnalysis> {
@@ -206,18 +228,6 @@ export const api = {
 
   async adminStats(): Promise<AdminStats> {
     return handle<AdminStats>(await fetch(apiUrl("/admin/stats"), withCreds()));
-  },
-
-  async adminLogs(service: "all" | "backend" | "worker" = "all", limit = 200, level?: string, q?: string): Promise<AdminLogItem[]> {
-    const params = new URLSearchParams();
-    params.set("service", service);
-    params.set("limit", String(limit));
-    if (level && level.trim()) params.set("level", level.trim());
-    if (q && q.trim()) params.set("q", q.trim());
-    const data = await handle<{ service: string; lines: AdminLogItem[] }>(
-      await fetch(apiUrl(`/admin/logs?${params.toString()}`), withCreds()),
-    );
-    return data.lines || [];
   },
 
   adminReportDownloadUrl(reportId: string, kind: "xlsx" | "raw" | "source"): string {
@@ -272,18 +282,18 @@ export const api = {
 
   async listExamples(): Promise<ExampleFile[]> {
     const data = await handle<{ examples: ExampleFile[] }>(
-      await fetch(apiUrl("/examples"), withCreds()),
+      await fetch(apiUrl(`/examples?language=${getUiLanguage()}`), withCreds()),
     );
     return data.examples;
   },
 
   async downloadExample(name: string): Promise<File> {
     const response = await fetch(
-      apiUrl(`/examples/${encodeURIComponent(name)}/download`),
+      apiUrl(`/examples/${encodeURIComponent(name)}/download?language=${getUiLanguage()}`),
       withCreds(),
     );
     if (!response.ok) {
-      throw new Error(`Не удалось скачать пример: ${response.status}`);
+      throw new Error(uiText("Не удалось скачать пример: {0}", response.status));
     }
     const blob = await response.blob();
     return new File([blob], name, { type: blob.type });
@@ -291,7 +301,7 @@ export const api = {
 
   async getReleaseNotes(): Promise<ReleaseEntry[]> {
     const data = await handle<{ releases: ReleaseEntry[]; source_missing?: boolean }>(
-      await fetch(apiUrl("/release-notes"), withCreds()),
+      await fetch(apiUrl(`/release-notes?language=${getUiLanguage()}`), withCreds()),
     );
     return data.releases || [];
   },
